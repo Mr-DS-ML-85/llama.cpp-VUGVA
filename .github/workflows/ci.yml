@@ -1,0 +1,63 @@
+# llama-cpp-VUGVA CI
+#
+# Builds the VUGVA backend and runs integration tests.
+# Requires: CUDA, 32+ GB RAM, NVIDIA GPU.
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux, cuda]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install CUDA
+        uses: Jimver/cuda-toolkit@v0.2.19
+        id: cuda-toolkit
+        with:
+          cuda-version: '12.4'
+
+      - name: Build VUGVA
+        run: |
+          cd vugva
+          cargo build --release
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=ON \
+            -DVUGVA_DRAM_GB=32
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Run integration test
+        run: |
+          # Requires a GGUF model file in test_data/
+          if [ -f test_data/model.gguf ]; then
+            ./build/vugva_test test_data/model.gguf "Hello"
+          else
+            echo "No test model found — skipping inference test"
+          fi
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check C++ formatting
+        run: |
+          sudo apt-get install -y clang-format
+          find ggml-vugva tests -name "*.cpp" -o -name "*.h" | \
+            xargs clang-format --dry-run --Werror

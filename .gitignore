@@ -1,0 +1,31 @@
+# Build
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CUDA
+*.cubin
+*.fatbin
+*.o
+*.obj
+
+# Rust/VUGVA
+**/target/
+Cargo.lock
+
+# Model files
+*.gguf
+*.bin

@@ -3,7 +3,7 @@
 /// Architecture:
 ///   VUGVA is a BUFFER TYPE ONLY (not a compute backend).
 ///   Weights live in pinned DRAM (cudaMallocHost → DMA-capable).
-///   CUDA is the compute engine. CPU is dummy (scheduler requirement).
+///   CUDA is the compute engine. CPU never touches data-plane traffic.
 ///
 /// CPU-Bypass DMA:
 ///   When CUDA needs a VUGVA_DRAM tensor, the scheduler copies it

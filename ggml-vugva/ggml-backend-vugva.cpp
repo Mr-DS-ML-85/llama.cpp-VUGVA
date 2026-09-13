@@ -1,17 +1,20 @@
-/// ggml-backend-vugva — VUGVA DRAM-as-cache-for-VRAM memory layer (CPU-bypass DMA)
+/// ggml-backend-vugva — VUGVA DRAM memory layer for ggml/llama.cpp
 ///
-/// Architecture (per VUGVA paper §3.3 + DeepSpeed ZeRO-Inference):
-///   All weights live in pinned DRAM (cudaMallocHost → DMA-capable).
-///   VUGVA graph_compute promotes active layers DRAM→VRAM via true DMA
-///   (cudaMemcpyAsync H2D from pinned source = zero CPU involvement).
-///   CUDA computes each layer on VRAM data.
-///   Promoted weights STAY in VRAM across tokens (LRU cache).
-///   CPU only touches 64-byte DMA descriptors per promotion.
+/// Architecture:
+///   VUGVA is a BUFFER TYPE ONLY (not a compute backend).
+///   Weights live in pinned DRAM (cudaMallocHost → DMA-capable).
+///   CUDA is the compute engine. CPU is dummy (scheduler requirement).
 ///
-/// Cache key: (buffer_base + tensor_data_offset) — stable across graph rebuilds.
+/// CPU-Bypass DMA:
+///   When CUDA needs a VUGVA_DRAM tensor, the scheduler copies it
+///   to VRAM via cudaMemcpyAsync. Since source is pinned (cudaMallocHost),
+///   this is TRUE DMA — CPU never touches the data.
 ///
-/// Dense model: all 32 layers same treatment, no MoE routing.
-/// LRU eviction when VRAM budget exhausted.
+/// Flow:
+///   1. Model weights loaded into VUGVA_DRAM (pinned host memory)
+///   2. Scheduler sees is_host=true, creates CUDA buffer, copies via DMA
+///   3. CUDA computes on VRAM data
+///   4. CPU only manages metadata, never data-plane traffic
 
 #include "ggml-backend-vugva.h"
 #include "ggml-backend-impl.h"
@@ -23,14 +26,8 @@
 #include <mutex>
 #include <new>
 #include <string>
-#include <unordered_map>
-#include <vector>
 
 #include <cuda_runtime.h>
-
-// ============================================================================
-// VUGVA pool FFI (Rust library)
-// ============================================================================
 
 extern "C" {
 typedef struct VugvaPool VugvaPool;
@@ -68,11 +65,9 @@ struct ggml_backend_vugva_context {
 
         VugvaPoolInfo info = {};
         vugva_pool_info(pool, &info);
-        fprintf(stderr, "[VUGVA] Pool: DRAM=%zu GB, NUMA=%s, pinned=%s (cudaMallocHost=%s)\n",
+        fprintf(stderr, "[VUGVA] DRAM pool: %zu GB, NUMA=%s (cudaMallocHost=always, DMA-capable)\n",
                 info.dram_capacity / 1024 / 1024 / 1024,
-                info.numa_bound ? "yes" : "no",
-                info.pinned ? "yes" : "no",
-                "always");  // actual alloc always uses cudaMallocHost
+                info.numa_bound ? "yes" : "no");
         return true;
     }
 
@@ -100,11 +95,7 @@ extern "C" int ggml_backend_vugva_init(ggml_backend_vugva_params params) {
 }
 
 // ============================================================================
-// VUGVA_DRAM buffer type — pinned host memory via cudaMallocHost
-//
-// cudaMallocHost allocates page-locked (pinned) memory.
-// cudaMemcpyAsync from pinned host → device = true DMA (no CPU staging).
-// This IS the CPU bypass: CPU never touches data plane.
+// VUGVA_DRAM buffer — pinned host memory (cudaMallocHost)
 // ============================================================================
 
 static bool vugva_is_vugva_buffer(ggml_backend_buffer_t buf) {
@@ -116,7 +107,7 @@ static bool vugva_is_vugva_buffer(ggml_backend_buffer_t buf) {
 struct ggml_backend_vugva_buffer_context {
     std::string name;
     size_t      size;
-    void *      dram_ptr;  // pinned via cudaMallocHost (DMA-capable)
+    void *      dram_ptr;
     bool        owns_dram_ptr;
 
     ggml_backend_vugva_buffer_context(const std::string & n, size_t sz, void * ptr, bool owns = true)
@@ -130,7 +121,7 @@ static void ggml_backend_vugva_buffer_free(ggml_backend_buffer_t buffer) {
             vugva_dealloc(vugva_ctx().pool, ctx->name.c_str());
         }
         if (ctx->dram_ptr && ctx->owns_dram_ptr) {
-            cudaFreeHost(ctx->dram_ptr);  // unpin
+            cudaFreeHost(ctx->dram_ptr);
         }
         delete ctx;
     }
@@ -221,7 +212,7 @@ static const ggml_backend_buffer_i ggml_backend_vugva_buffer_interface = {
 };
 
 // ============================================================================
-// VUGVA_DRAM buffer type interface
+// VUGVA_DRAM buffer type
 // ============================================================================
 
 struct ggml_backend_vugva_buffer_type_context {
@@ -255,8 +246,6 @@ static ggml_backend_buffer_t ggml_backend_vugva_buft_alloc_buffer(
     int rc = vugva_alloc(vctx.pool, name.c_str(), size);
     if (rc != 0) return nullptr;
 
-    // cudaMallocHost = page-locked (pinned) memory.
-    // cudaMemcpyAsync H2D from this = true DMA, zero CPU involvement.
     void * dram_ptr = nullptr;
     cudaError_t err = cudaMallocHost(&dram_ptr, size);
     if (err != cudaSuccess) {
@@ -300,7 +289,8 @@ static size_t ggml_backend_vugva_buft_get_alloc_size(
     return ggml_nbytes(tensor);
 }
 
-// is_host=true: CUDA can DMA from these buffers (pinned memory).
+// is_host=true: scheduler copies these to CUDA via cudaMemcpyAsync.
+// Since source is cudaMallocHost (pinned), this is TRUE DMA. CPU bypass.
 static bool ggml_backend_vugva_buft_is_host(ggml_backend_buffer_type_t buft) {
     (void)buft;
     return true;
@@ -316,197 +306,14 @@ static const ggml_backend_buffer_type_i ggml_backend_vugva_buffer_type_interface
 };
 
 // ============================================================================
-// VRAM cache — promotes DRAM weights to VRAM via CPU-bypass DMA
-//
-// Key: (buffer_base + tensor_data_offset) — stable across graph rebuilds.
-// Value: CUDA buffer + VRAM pointer.
-// Promoted weights STAY in VRAM across tokens (cache hit on next token).
-// LRU eviction when VRAM budget exhausted.
-// ============================================================================
-
-struct vugva_vram_entry {
-    ggml_backend_buffer_t cuda_buf;
-    void * vram_ptr;        // VRAM pointer for CUDA compute
-    void * dram_src;        // pinned DRAM source for DMA
-    size_t nbytes;
-    uint64_t last_access;   // token counter for LRU
-};
-
-// Cache key: stable identifier for a weight tensor's data
-struct vugva_cache_key {
-    void * buffer_base;     // ggml_backend_buffer base pointer
-    size_t data_offset;     // tensor->data - buffer_base
-
-    bool operator==(const vugva_cache_key & o) const {
-        return buffer_base == o.buffer_base && data_offset == o.data_offset;
-    }
-};
-
-struct vugva_cache_key_hash {
-    size_t operator()(const vugva_cache_key & k) const {
-        size_t h1 = std::hash<void*>{}(k.buffer_base);
-        size_t h2 = std::hash<size_t>{}(k.data_offset);
-        return h1 ^ (h2 * 0x9e3779b97f4a7c15ULL);  // better hash mixing
-    }
-};
-
-struct vugva_vram_cache {
-    std::unordered_map<vugva_cache_key, vugva_vram_entry, vugva_cache_key_hash> entries;
-    size_t vram_used = 0;
-    size_t vram_capacity = 0;
-    uint64_t token_counter = 0;
-    ggml_backend_buffer_type_t cuda_buft = nullptr;
-    size_t promote_count = 0;
-    size_t cache_hit_count = 0;
-    size_t cache_miss_count = 0;
-
-    void init(size_t capacity, ggml_backend_buffer_type_t buft) {
-        vram_capacity = capacity;
-        cuda_buft = buft;
-    }
-
-    void new_token() {
-        token_counter++;
-        // Log stats every 100 tokens
-        if (token_counter % 100 == 0 && (promote_count + cache_hit_count) > 0) {
-            fprintf(stderr, "[VUGVA] VRAM cache: %zu entries, %zu MB/%zu MB, "
-                    "promotes=%zu, hits=%zu, misses=%zu\n",
-                    entries.size(),
-                    vram_used / 1024 / 1024, vram_capacity / 1024 / 1024,
-                    promote_count, cache_hit_count, cache_miss_count);
-            promote_count = 0;
-            cache_hit_count = 0;
-            cache_miss_count = 0;
-        }
-    }
-
-    // Build cache key from tensor
-    static vugva_cache_key make_key(struct ggml_tensor * tensor) {
-        if (!tensor || !tensor->buffer) return {nullptr, 0};
-        void * base = tensor->buffer->iface.get_base(tensor->buffer);
-        size_t offset = (char *)tensor->data - (char *)base;
-        return {base, offset};
-    }
-
-    // Promote a tensor from pinned DRAM → VRAM via CPU-bypass DMA.
-    // Returns VRAM pointer. Cache key is (buffer_base + offset).
-    void * promote(struct ggml_tensor * tensor) {
-        if (!tensor || !tensor->buffer) return nullptr;
-
-        vugva_cache_key key = make_key(tensor);
-
-        // Cache hit? Return existing VRAM pointer
-        auto it = entries.find(key);
-        if (it != entries.end()) {
-            it->second.last_access = token_counter;
-            cache_hit_count++;
-            return it->second.vram_ptr;
-        }
-
-        cache_miss_count++;
-
-        size_t nbytes = ggml_nbytes(tensor);
-        if (nbytes == 0) return nullptr;
-
-        // Evict LRU entries until we have space
-        while (vram_used + nbytes > vram_capacity && !entries.empty()) {
-            evict_lru();
-        }
-
-        // If still no space, can't promote
-        if (vram_used + nbytes > vram_capacity) {
-            fprintf(stderr, "[VUGVA] VRAM full: cannot promote %zu MB (have %zu/%zu MB)\n",
-                    nbytes / 1024 / 1024, vram_used / 1024 / 1024, vram_capacity / 1024 / 1024);
-            return nullptr;
-        }
-
-        // Allocate VRAM buffer
-        ggml_backend_buffer_t cuda_buf = cuda_buft->iface.alloc_buffer(cuda_buft, nbytes);
-        if (!cuda_buf) return nullptr;
-
-        void * vram_ptr = cuda_buf->iface.get_base(cuda_buf);
-        void * dram_ptr = tensor->buffer->iface.get_base(tensor->buffer);
-        if (!vram_ptr || !dram_ptr) {
-            cuda_buf->iface.free_buffer(cuda_buf);
-            return nullptr;
-        }
-
-        // CPU-bypass DMA: pinned DRAM → VRAM (zero CPU involvement)
-        // cudaMallocHost gives us page-locked memory.
-        // cudaMemcpyAsync(H2D) from pinned = true DMA transfer.
-        // CPU only touches the 64-byte DMA descriptor, not the data.
-        cudaError_t err = cudaMemcpyAsync(
-            vram_ptr,                          // dst: VRAM
-            (char *)dram_ptr + key.data_offset, // src: pinned DRAM
-            nbytes,
-            cudaMemcpyHostToDevice,            // H2D = DMA from pinned
-            cudaStreamPerThread);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "[VUGVA] DMA H2D failed: %s\n", cudaGetErrorString(err));
-            cuda_buf->iface.free_buffer(cuda_buf);
-            return nullptr;
-        }
-
-        entries[key] = {cuda_buf, vram_ptr, (char *)dram_ptr + key.data_offset, nbytes, token_counter};
-        vram_used += nbytes;
-        promote_count++;
-
-        return vram_ptr;
-    }
-
-    // Evict least recently used entry
-    void evict_lru() {
-        if (entries.empty()) return;
-
-        vugva_cache_key lru_key = {nullptr, 0};
-        uint64_t lru_time = UINT64_MAX;
-        for (auto & [key, entry] : entries) {
-            if (entry.last_access < lru_time) {
-                lru_time = entry.last_access;
-                lru_key = key;
-            }
-        }
-
-        auto it = entries.find(lru_key);
-        if (it != entries.end()) {
-            it->second.cuda_buf->iface.free_buffer(it->second.cuda_buf);
-            vram_used -= it->second.nbytes;
-            entries.erase(it);
-        }
-    }
-
-    void free_all() {
-        for (auto & [key, entry] : entries) {
-            entry.cuda_buf->iface.free_buffer(entry.cuda_buf);
-        }
-        entries.clear();
-        vram_used = 0;
-    }
-};
-
-// ============================================================================
-// VUGVA backend context
+// VUGVA backend — MEMORY LAYER ONLY (no compute, no graph_compute)
 // ============================================================================
 
 struct ggml_backend_vugva_context_backend {
     int gpu_id;
     ggml_backend_buffer_type_t buft;
     ggml_backend_dev_t dev;
-    ggml_backend_t cuda_backend;
-    vugva_vram_cache cache;
 };
-
-struct vugva_promoted_tensor {
-    struct ggml_tensor * tensor;
-    void * orig_data;       // original DRAM data pointer
-    void * vram_ptr;        // promoted VRAM pointer
-    size_t nbytes;
-    bool is_weight;         // weights stay in VRAM, intermediates get restored
-};
-
-// ============================================================================
-// ggml_backend_i implementation
-// ============================================================================
 
 static const char * ggml_backend_vugva_get_name(ggml_backend_t backend) {
     (void)backend;
@@ -515,11 +322,7 @@ static const char * ggml_backend_vugva_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_vugva_free(ggml_backend_t backend) {
     auto * ctx = (ggml_backend_vugva_context_backend *)backend->context;
-    if (ctx) {
-        ctx->cache.free_all();
-        if (ctx->cuda_backend) ggml_backend_free(ctx->cuda_backend);
-        delete ctx;
-    }
+    delete ctx;
     delete backend;
 }
 
@@ -584,95 +387,10 @@ static bool ggml_backend_vugva_cpy_tensor_async(ggml_backend_t backend_src,
 
 static void ggml_backend_vugva_synchronize(ggml_backend_t backend) {
     (void)backend;
-    cudaStreamSynchronize(cudaStreamPerThread);
 }
 
-// ============================================================================
-// graph_compute — CPU-bypass DMA staging: DRAM → VRAM → CUDA compute
-//
-// Dense model (all 32 layers same treatment):
-//   Phase 1: Promote weight sources DRAM→VRAM via DMA (cache stays warm)
-//   Phase 2: Execute each node on CUDA (VRAM data)
-//   Phase 3: Restore non-weight tensor pointers
-//   Weight tensors stay in VRAM across tokens (cache hit next token)
-// ============================================================================
-
-static enum ggml_status ggml_backend_vugva_graph_compute(
-    ggml_backend_t backend, struct ggml_cgraph * graph) {
-
-    auto * ctx = (ggml_backend_vugva_context_backend *)backend->context;
-    if (!ctx->cuda_backend) return GGML_STATUS_FAILED;
-
-    auto * cuda_buft = ggml_backend_get_default_buffer_type(ctx->cuda_backend);
-    if (!cuda_buft) return GGML_STATUS_FAILED;
-
-    // Initialize VRAM cache: 7 GB for weights (leave 1 GB for KV + workspace)
-    if (ctx->cache.vram_capacity == 0) {
-        size_t vram_budget = 7ULL * 1024 * 1024 * 1024;
-        ctx->cache.init(vram_budget, cuda_buft);
-        fprintf(stderr, "[VUGVA] VRAM cache: %zu GB budget\n", vram_budget / 1024 / 1024 / 1024);
-    }
-    ctx->cache.new_token();
-
-    // Track promoted tensors for restore
-    std::vector<vugva_promoted_tensor> promoted;
-    promoted.reserve(64);  // ~32 layers × 2 tensors per layer
-
-    // Phase 1: Promote weight sources from pinned DRAM → VRAM via CPU-bypass DMA
-    // Only promote WEIGHT tensors (persistent). Intermediates are temporary.
-    for (int i = 0; i < graph->n_nodes; i++) {
-        struct ggml_tensor * node = graph->nodes[i];
-        if (ggml_is_view(node)) continue;
-
-        // Promote weight sources
-        for (int j = 0; j < GGML_MAX_SRC; j++) {
-            struct ggml_tensor * src = node->src[j];
-            if (!src || !src->buffer) continue;
-            if (!vugva_is_vugva_buffer(src->buffer)) continue;
-            if (ggml_nbytes(src) == 0) continue;
-
-            // Skip if already promoted this graph
-            vugva_cache_key key = vugva_vram_cache::make_key(src);
-            bool already = false;
-            for (auto & p : promoted) {
-                if (vugva_vram_cache::make_key(p.tensor) == key) { already = true; break; }
-            }
-            if (already) continue;
-
-            // Promote: pinned DRAM → VRAM via DMA (cache hit if already promoted)
-            void * vram_ptr = ctx->cache.promote(src);
-            if (vram_ptr) {
-                promoted.push_back({src, src->data, vram_ptr, ggml_nbytes(src), true});
-                src->data = vram_ptr;  // point tensor to VRAM
-            }
-            // If promote fails (VRAM full), tensor stays in DRAM (is_host=true)
-            // ggml scheduler will handle it via its normal copy mechanism
-        }
-    }
-    cudaStreamSynchronize(cudaStreamPerThread);  // wait for DMA
-
-    // Phase 2: Execute each node on CUDA (VRAM data)
-    for (int i = 0; i < graph->n_nodes; i++) {
-        struct ggml_cgraph node_graph = ggml_graph_view(graph, i, i + 1);
-        enum ggml_status st = ggml_backend_graph_compute(ctx->cuda_backend, &node_graph);
-        if (st != GGML_STATUS_SUCCESS) {
-            // Restore on failure
-            for (auto & p : promoted) {
-                p.tensor->data = p.orig_data;
-            }
-            return st;
-        }
-    }
-
-    // Phase 3: Restore tensor data pointers for next graph build
-    // Weight tensors: restore to DRAM pointer (VRAM cache preserves the data)
-    // Next graph: cache hit, no re-copy needed
-    for (auto & p : promoted) {
-        p.tensor->data = p.orig_data;  // restore original DRAM pointer
-    }
-
-    return GGML_STATUS_SUCCESS;
-}
+// No graph_compute — CUDA handles all compute via scheduler
+// No supports_op — VUGVA is buffer-only, scheduler routes ops to CUDA/CPU
 
 static const ggml_backend_i ggml_backend_vugva_interface = {
     /* .get_name          = */ ggml_backend_vugva_get_name,
@@ -687,7 +405,7 @@ static const ggml_backend_i ggml_backend_vugva_interface = {
     /* .graph_plan_free   = */ NULL,
     /* .graph_plan_update = */ NULL,
     /* .graph_plan_compute = */ NULL,
-    /* .graph_compute     = */ ggml_backend_vugva_graph_compute,
+    /* .graph_compute     = */ NULL,  // MEMORY LAYER — no compute
     /* .event_record      = */ NULL,
     /* .event_wait        = */ NULL,
     /* .graph_optimize    = */ NULL,
@@ -706,7 +424,7 @@ static ggml_guid_t ggml_backend_vugva_guid() {
 }
 
 // ============================================================================
-// ggml_backend_device_i
+// Device interface
 // ============================================================================
 
 struct ggml_backend_vugva_device_context {
@@ -778,15 +496,6 @@ static ggml_backend_t ggml_backend_vugva_dev_init_backend(ggml_backend_dev_t dev
 
     backend_ctx->gpu_id = dev_ctx->gpu_id;
 
-    // Find and init CUDA backend for compute delegation
-    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-        ggml_backend_dev_t d = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            backend_ctx->cuda_backend = ggml_backend_dev_init(d, nullptr);
-            break;
-        }
-    }
-
     auto * buft_ctx = new(std::nothrow) ggml_backend_vugva_buffer_type_context();
     if (!buft_ctx) { delete backend_ctx; return nullptr; }
     buft_ctx->gpu_id = dev_ctx->gpu_id;
@@ -853,9 +562,10 @@ static ggml_backend_buffer_t ggml_backend_vugva_dev_buffer_from_host_ptr(
     return buffer;
 }
 
+// supports_op=false: VUGVA is buffer-only, scheduler routes ops to CUDA/CPU
 static bool ggml_backend_vugva_dev_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     (void)dev; (void)op;
-    return true;
+    return false;
 }
 
 static bool ggml_backend_vugva_dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
@@ -864,9 +574,10 @@ static bool ggml_backend_vugva_dev_supports_buft(ggml_backend_dev_t dev, ggml_ba
     return strcmp(name, "VUGVA_DRAM") == 0;
 }
 
+// offload_op=false: VUGVA doesn't compute, CUDA does
 static bool ggml_backend_vugva_dev_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     (void)dev; (void)op;
-    return true;
+    return false;
 }
 
 static const ggml_backend_device_i ggml_backend_vugva_device_interface = {
@@ -888,7 +599,7 @@ static const ggml_backend_device_i ggml_backend_vugva_device_interface = {
 };
 
 // ============================================================================
-// ggml_backend_reg_i
+// Registration
 // ============================================================================
 
 struct ggml_backend_vugva_reg_context {
@@ -943,7 +654,7 @@ extern "C" ggml_backend_reg_t ggml_backend_vugva_reg(void) {
     static ggml_backend_vugva_device_context dev_ctx;
     dev_ctx.gpu_id = vugva_ctx().gpu_id;
     dev_ctx.name = "VUGVA";
-    dev_ctx.description = "VUGVA DRAM cache for VRAM (CPU-bypass DMA, pinned memory)";
+    dev_ctx.description = "VUGVA DRAM (pinned, DMA-capable, CPU-bypass)";
 
     static struct ggml_backend_device dev;
     dev.iface   = ggml_backend_vugva_device_interface;

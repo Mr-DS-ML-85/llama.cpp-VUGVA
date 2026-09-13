@@ -1,6 +1,6 @@
 # ggml-vugva: VUGVA tiered memory backend for ggml
 #
-# Build as a static library and link with llama.cpp.
+# Flow: ggml → VUGVA (DRAM) → CUDA (VRAM compute)
 
 cmake_minimum_required(VERSION 3.14)
 project(ggml-vugva LANGUAGES CXX)
@@ -22,15 +22,23 @@ endif()
 add_library(ggml-vugva STATIC
     ggml-backend-vugva.cpp
 )
+set_target_properties(ggml-vugva PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(ggml-vugva PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/include
+    ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/src
 )
 
+# Link VUGVA (DRAM pool) + CUDA (delegated compute) + ggml-base
 target_link_libraries(ggml-vugva PUBLIC
     ${VUGVA_LIB}
-    CUDA::cudart
-    CUDA::cuda_driver
+    ggml-base
     pthread
     dl
 )
+
+# CUDA comes from the top-level find_package(CUDAToolkit)
+if(GGML_CUDA)
+    target_link_libraries(ggml-vugva PUBLIC ggml-cuda CUDA::cudart CUDA::cuda_driver CUDA::cublas)
+endif()

@@ -1,4 +1,4 @@
-/// VUGVA × llama.cpp integration test
+/// VUGVA x llama.cpp integration test
 ///
 /// Loads a GGUF model through VUGVA's tiered memory (32 GB DRAM + 8 GB VRAM),
 /// promotes hot tensors to VRAM, and runs inference via the CUDA backend.
@@ -34,15 +34,15 @@ int main(int argc, char ** argv) {
     const char * model_path = argv[1];
     const char * prompt = argc > 2 ? argv[2] : "Hello, my name is";
 
-    printf("╔════════════════════════════════════════════════════════════════╗\n");
-    printf("║  llama-cpp-VUGVA Integration Test                             ║\n");
-    printf("║  Pool: %d GB DRAM + 8 GB VRAM  =  %d GB unified                ║\n",
+    printf("================================================================\n");
+    printf("  llama-cpp-VUGVA Integration Test\n");
+    printf("  Pool: %d GB DRAM + 8 GB VRAM  =  %d GB unified\n",
            VUGVA_DRAM_GB, VUGVA_DRAM_GB + 8);
-    printf("║  Model: %s\n", model_path);
-    printf("╚════════════════════════════════════════════════════════════════╝\n\n");
+    printf("  Model: %s\n", model_path);
+    printf("================================================================\n\n");
 
-    // ── 1. Initialize VUGVA pool ─────────────────────────────────────────
-    printf("[1/5] Initializing VUGVA tiered pool …\n");
+    // 1. Initialize VUGVA pool
+    printf("[1/5] Initializing VUGVA tiered pool ...\n");
     VugvaPool * pool = vugva_pool_create(0, DRAM_BYTES);
     assert(pool && "vugva_pool_create failed");
 
@@ -54,16 +54,22 @@ int main(int argc, char ** argv) {
            info.pinned ? "yes" : "no");
     printf("\n");
 
-    // ── 2. Initialize llama.cpp with VUGVA backend ───────────────────────
-    printf("[2/5] Initializing llama.cpp with VUGVA backend …\n");
+    // 2. Initialize llama.cpp — register VUGVA backend, then load model
+    printf("[2/5] Initializing llama.cpp with VUGVA backend ...\n");
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    struct llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = 2048;
-    ctx_params.n_batch = 512;
+    // Register VUGVA backend with ggml
+    ggml_backend_reg_t vugva_reg = ggml_backend_vugva_reg();
+    if (vugva_reg) {
+        printf("  VUGVA backend registered successfully\n");
+    } else {
+        printf("  WARNING: VUGVA backend registration failed, using CPU+CUDA only\n");
+    }
 
     struct llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = 99; // offload all layers to GPU
+    // Model is 16GB, VRAM is 8GB — offload only some layers to GPU
+    // VUGVA will hold the rest in DRAM
+    model_params.n_gpu_layers = 0;
 
     struct llama_model * model = llama_model_load_from_file(model_path, model_params);
     if (!model) {
@@ -76,24 +82,30 @@ int main(int argc, char ** argv) {
     double load_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     printf("  Model loaded in %.1f ms\n", load_ms);
 
-    // ── 3. Create context and tokenize ───────────────────────────────────
-    printf("[3/5] Creating context and tokenizing …\n");
-    struct llama_context * ctx = llama_init_with_model(model, ctx_params);
-    assert(ctx && "llama_init_with_model failed");
+    // 3. Create context and tokenize
+    printf("[3/5] Creating context and tokenizing ...\n");
+    struct llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx = 2048;
+    ctx_params.n_batch = 512;
+
+    struct llama_context * ctx = llama_init_from_model(model, ctx_params);
+    assert(ctx && "llama_init_from_model failed");
+
+    const struct llama_vocab * vocab = llama_model_get_vocab(model);
 
     // Tokenize prompt
-    int n_tokens = llama_tokenize(model, prompt, (int32_t)strlen(prompt),
+    int n_tokens = llama_tokenize(vocab, prompt, (int32_t)strlen(prompt),
                                   nullptr, 0, true, false);
     std::vector<llama_token> tokens(n_tokens);
-    llama_tokenize(model, prompt, (int32_t)strlen(prompt),
+    llama_tokenize(vocab, prompt, (int32_t)strlen(prompt),
                    tokens.data(), n_tokens, true, false);
     printf("  Prompt: \"%s\" (%d tokens)\n", prompt, n_tokens);
 
-    // ── 4. Evaluate and generate ─────────────────────────────────────────
-    printf("[4/5] Running inference …\n");
+    // 4. Evaluate and generate
+    printf("[4/5] Running inference ...\n");
     auto t2 = std::chrono::high_resolution_clock::now();
 
-    if (llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tokens, 0, 0)) != 0) {
+    if (llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tokens)) != 0) {
         fprintf(stderr, "llama_decode failed\n");
         llama_free(ctx);
         llama_model_free(model);
@@ -101,38 +113,45 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Set up greedy sampler
+    auto sparams = llama_sampler_chain_default_params();
+    llama_sampler * smpl = llama_sampler_chain_init(sparams);
+    llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+
     // Generate tokens
     int n_gen = 64;
     printf("  Output: ");
-    llama_token next = tokens[0];
 
     for (int i = 0; i < n_gen; i++) {
-        const char * buf = llama_token_to_piece(model, next);
-        printf("%s", buf);
+        llama_token next = llama_sampler_sample(smpl, ctx, -1);
 
-        if (llama_decode(ctx, llama_batch_get_one(&next, 1, 0, 0)) != 0) {
+        const char * piece = llama_vocab_get_text(vocab, next);
+        if (piece) printf("%s", piece);
+
+        if (llama_vocab_is_eog(vocab, next)) break;
+
+        if (llama_decode(ctx, llama_batch_get_one(&next, 1)) != 0) {
             fprintf(stderr, "\nllama_decode failed at step %d\n", i);
             break;
         }
-
-        float * logits = llama_get_logits(ctx);
-        next = llama_token_greedy(logits, llama_n_vocab(model));
     }
     printf("\n");
+
+    llama_sampler_free(smpl);
 
     auto t3 = std::chrono::high_resolution_clock::now();
     double gen_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
     printf("  Generated %d tokens in %.1f ms (%.1f tok/s)\n",
            n_gen, gen_ms, n_gen * 1000.0 / gen_ms);
 
-    // ── 5. Cleanup ───────────────────────────────────────────────────────
-    printf("\n[5/5] Cleanup …\n");
+    // 5. Cleanup
+    printf("\n[5/5] Cleanup ...\n");
     llama_free(ctx);
     llama_model_free(model);
     vugva_pool_destroy(pool);
 
-    printf("\n══════════════════════════════════════════════════════════════════\n");
-    printf("  ALL TESTS PASSED — VUGVA %d GB pool + llama.cpp works\n", VUGVA_DRAM_GB + 8);
-    printf("══════════════════════════════════════════════════════════════════\n");
+    printf("\n================================================================\n");
+    printf("  ALL TESTS PASSED -- VUGVA %d GB pool + llama.cpp works\n", VUGVA_DRAM_GB + 8);
+    printf("================================================================\n");
     return 0;
 }

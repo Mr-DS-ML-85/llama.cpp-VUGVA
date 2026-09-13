@@ -44,8 +44,6 @@ llama-cpp-VUGVA/
 ├── ggml-vugva/              # VUGVA ggml backend
 │   ├── ggml-backend-vugva.h # Public API
 │   └── ggml-backend-vugva.cpp
-├── tests/
-│   └── test_vugva.cpp       # Integration test
 ├── llama.cpp/               # Upstream llama.cpp (submodule)
 ├── CMakeLists.txt
 └── README.md

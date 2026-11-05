@@ -73,6 +73,35 @@ llama_perf_context_print: prompt eval time =  431.24 ms / 11 tokens (39.20 ms/to
 llama_perf_context_print:       eval time = 1934.53 ms / 47 runs  (41.16 ms/token, 24.30 t/s)
 ```
 
+### Dynamic promotion (`VUGVA_HOT_CACHE_MB`)
+
+Qwen3.5 0.8B, static budget forced to `VUGVA_VRAM_MB=100` (8/25 layers hot,
+394 MiB in the DRAM tier), greedy, 24 tokens. Every run produced identical text.
+
+| `VUGVA_HOT_CACHE_MB` | promoted | evictions | hits | decode |
+|---|---|---|---|---|
+| 0 (static) | – | – | – | 25.3 t/s |
+| 64 | 2708 MiB | 2912 | 433 | 18.5 t/s |
+| 2048 | 394 MiB | 0 | 3210 | **149.1 t/s** |
+| full-GPU reference (`-ngl 99`, no force) | – | – | – | 202.5 t/s |
+
+Reading: with a cache that holds the working set, promotion recovers most of the
+full-GPU speed without changing placement. With a cache smaller than the working
+set, LRU evicts tensors the next step needs again and decode slows down — the
+counters make it obvious.
+
+27B dense on a full card: `VUGVA_HOT_CACHE_MB=512` is refused
+(`only 961 MiB VRAM free, need 1024 MiB`) and decode stays at 1.20 t/s. Forced
+through anyway it ran at 0.60 t/s, which is why the gate exists.
+
+### Cold-tier readahead (`VUGVA_PRELOAD`)
+
+The 35B MoE keeps 19.5 GB of experts in mmap'd CPU memory. With preload enabled,
+the background thread reported `4480/20707 MiB read ahead` during a 48-token run
+(it stops when decode finishes, or when `MemAvailable` drops under 2 GiB).
+`buff/cache` grows; RSS does not. On a cold cache this is what turns the first
+pass from ~4 t/s into ~20-40 t/s.
+
 ## How to reproduce
 
 ```bash
@@ -84,6 +113,10 @@ VUGVA_VRAM_MB=100 VUGVA_MODE=zerocopy \
 # dense spill
 VUGVA_MODE=zerocopy ./build/llama-cli -m qwen27b.gguf -n 32 -ngl 99 "Write a story"
 VUGVA_MODE=hybrid   ./build/llama-cli -m qwen27b.gguf -n 32 -ngl 99 "Write a story"
+
+# dynamic promotion
+VUGVA_VRAM_MB=100 VUGVA_MODE=zerocopy VUGVA_HOT_CACHE_MB=2048 VUGVA_STATS=1 \
+  ./build/llama-cli -m qwen0.8b.gguf -n 24 -ngl 99 "The capital of France is"
 
 # MoE fast path (automatic)
 ./build/llama-cli -m ornith35b.gguf -n 64 -ngl 99 -ctk q4_0 -ctv q4_0 \

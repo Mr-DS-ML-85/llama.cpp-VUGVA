@@ -1,12 +1,95 @@
 #include "llama.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
+#include <atomic>
 #include <clocale>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+// ── VUGVA cold-tier look-ahead prefetch ─────────────────────────────────────
+// The cold tier is the OS page cache over the GGUF file. While the model loads
+// (and during the first decode), a background thread asks the kernel to read
+// the file ahead with POSIX_FADV_WILLNEED. Clean file pages are reclaimable, so
+// this cannot pin RAM or OOM the machine, and it yield-steps so on-demand faults
+// always win. VUGVA_PRELOAD=0 disables it.
+static std::atomic<bool>   g_prefetch_stop{false};
+static std::atomic<size_t> g_prefetch_done{0};
+static std::atomic<size_t> g_prefetch_total{0};
+static std::thread         g_prefetch_thread;
+
+static size_t vugva_mem_available(void) {
+    size_t avail = 0;
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            size_t kb = 0;
+            if (sscanf(line, "MemAvailable: %zu kB", &kb) == 1) {
+                avail = kb * 1024;
+            }
+        }
+        fclose(f);
+    }
+    return avail;
+}
+
+static void vugva_prefetch_run(std::string path) {
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return;
+    }
+    struct stat st = {};
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        close(fd);
+        return;
+    }
+    const size_t fsz   = (size_t) st.st_size;
+    const size_t chunk = 64ull << 20;
+    g_prefetch_total = fsz;
+
+    for (size_t off = 0; off < fsz && !g_prefetch_stop.load(); off += chunk) {
+        if (vugva_mem_available() < (2ull << 30)) {
+            break; // do not push the machine into reclaim pressure
+        }
+        const size_t n = std::min(chunk, fsz - off);
+        if (posix_fadvise(fd, (off_t) off, (off_t) n, POSIX_FADV_WILLNEED) != 0) {
+            break;
+        }
+        g_prefetch_done = off + n;
+        usleep(20000); // 20 ms per 64 MiB: real page faults stay ahead
+    }
+    close(fd);
+}
+
+static void vugva_prefetch_start(const std::string & path) {
+    const char * env = getenv("VUGVA_PRELOAD");
+    if (env && env[0] == '0' && env[1] == '\0') {
+        return;
+    }
+    g_prefetch_thread = std::thread(vugva_prefetch_run, path);
+}
+
+static void vugva_prefetch_stop_and_report(void) {
+    g_prefetch_stop = true;
+    if (g_prefetch_thread.joinable()) {
+        g_prefetch_thread.join();
+    }
+    const size_t done  = g_prefetch_done.load();
+    const size_t total = g_prefetch_total.load();
+    if (total > 0) {
+        fprintf(stderr, "%s: [vugva] cold-tier prefetch: %zu/%zu MiB read ahead (%.0f%%)\n",
+                __func__, done >> 20, total >> 20, 100.0 * (double) done / (double) total);
+    }
+}
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
@@ -181,6 +264,9 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // look-ahead prefetch of the cold tier (GGUF on NVMe -> page cache)
+    vugva_prefetch_start(model_path);
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     const int n_prompt = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), NULL, 0, true, true);
@@ -308,5 +394,6 @@ int main(int argc, char ** argv) {
     llama_sampler_free(smpl);
     llama_free(ctx);
     llama_model_free(model);
+    vugva_prefetch_stop_and_report();
     return 0;
 }

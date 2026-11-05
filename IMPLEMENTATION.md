@@ -106,21 +106,112 @@ Placement changes in `llama.cpp/src/llama-model.cpp`:
 * CPU-buft overrides (`--cpu-moe`) now use the plain CPU buffer (mmap-backed)
   instead of the VUGVA DRAM tier, avoiding a full copy of the expert stack.
 
-## Not implemented (paper claims without corresponding code)
+## Paper vs. code: what is implemented, what is not
 
-Be honest about the gap between paper and code:
+Three of the paper's mechanisms are implemented; one is partially implemented;
+one cannot be implemented in llama.cpp's execution model, and one is hardware
+gated. Everything below is reproduced on the reference machine (RTX 4060 8 GB,
+29 GB RAM, NVMe, CUDA 13.2) with the numbers from `docs/benchmarks.md`.
 
-- **Look-Ahead Attention prefetch (Algorithm 3)** — no background DRAM→VRAM
-  weight streaming exists (`vugva`'s `prefetch.rs`/`dma.rs` are not called by
-  the ggml backend). It is unnecessary for the current placement: hot-tier
-  weights are already resident in VRAM and warm-tier weights are read directly
-  by the CPU without promotion.
-- **Runtime promotion/eviction of individual tensors** (membrane-driven tiering)
-  — placement is static for the lifetime of the run (`-ngl` + VRAM budget).
-- **GPUDirect Storage / IOMMU P2P** — the cold tier is the OS page cache over
-  the GGUF file on NVMe, not GDS.
-- The paper's measured numbers (54.8% throughput, 84.6% CPU reduction, …) are
-  not reproduced or asserted by this codebase.
+| Paper claim | Status | Where |
+|---|---|---|
+| Three-tier placement VRAM → DRAM → SSD (§3.1) | **implemented** | `llama-model.cpp` Algorithm 1 block, `VUGVA_DRAM` buft |
+| CPU-bypass data plane (§5.1) | **implemented** (load + zero-copy reads) | mapped pinned DRAM + UVA |
+| Algorithm 1: static placement into the hot tier | **implemented** | contiguous hot prefix, tied-embedding aware |
+| Algorithm 2: membrane-driven promotion / eviction | **implemented, opt-in** | `VUGVA_HOT_CACHE_MB`, tier manager below |
+| Algorithm 3: look-ahead prefetch | **partially implemented** (cold tier) | `VUGVA_PRELOAD`; DRAM→VRAM pipelining deliberately absent |
+| GPUDirect Storage / IOMMU P2P cold tier | **not available on this hardware**, probed at runtime | `ggml_backend_vugva_probe_cold_tier` |
+| Paper's aggregate numbers (+54.8% throughput, −84.6% CPU) | **not reproduced**; different hardware and workload | our own table below |
+
+### 1. Promotion / eviction of individual tensors — implemented (opt-in)
+
+`ggml-vugva/ggml-backend-vugva.cpp` → *Tier manager*, called from
+`llama_context::graph_compute` (`tier_begin` before the scheduler runs,
+`tier_end` after it is enqueued).
+
+* On each decode step the graph's leaf weight tensors in `VUGVA_DRAM` are
+  walked **in graph (layer) order**, which is the paper's look-ahead order.
+* A miss allocates a VRAM slot, `cudaMemcpyAsync`s the tensor on a dedicated
+  non-blocking stream and redirects `tensor->data` to it. A hit just bumps the
+  LRU clock. Under budget pressure the least-recently-used slot is evicted and
+  its tensor is pointed back at DRAM.
+* Redirection is **stable across steps**: llama.cpp's CUDA-graph cache keys on
+  source pointers, so moving a pointer every step would disable graph capture.
+  Pointers change only on promotion and eviction.
+* The cache refuses to enable when static placement already filled VRAM
+  (`VUGVA_HOT_CACHE_MB` > free VRAM ⇒ warn and stay static), because that
+  pathological case is measurable: 27B, 17.4 GB, 512 MiB cache on a full card
+  ran at **0.60 t/s vs 1.20 t/s** static. With the gate, the same command
+  reports `hot cache ignored: only 961 MiB VRAM free` and keeps 1.20 t/s.
+
+Measured effect (Qwen3.5 0.8B Q4_K_M, static budget forced to 100 MiB so only
+8/25 layers are hot, greedy, 24 tokens, identical output text in all runs):
+
+| `VUGVA_HOT_CACHE_MB` | promoted | evictions | decode |
+|---|---|---|---|
+| 0 (static only) | – | – | 25.3 t/s |
+| 64 | 2708 MiB | 2912 | **18.5 t/s** (thrashing, as expected when the cache is smaller than the working set) |
+| 2048 | 394 MiB | 0 | **149.1 t/s** (5.9× over static, ≈ full-GPU speed of 202 t/s) |
+
+So the membrane behaves as the paper describes: gain when the cache holds the
+per-token working set, loss when it does not — and the loss is visible in the
+counters (`VUGVA_STATS=1`) instead of hiding as "it feels slow".
+
+### 2. Look-Ahead prefetch (Algorithm 3) — partially implemented
+
+**Implemented: cold-tier readahead.** `VUGVA_PRELOAD` (default on) starts a
+background thread after the model loads and issues
+`posix_fadvise(..., POSIX_FADV_WILLNEED)` over the GGUF in 64 MiB chunks, 20 ms
+apart, stopping below 2 GiB of `MemAvailable`. It is the tier that actually
+reads from NVMe (the experts of a sparse MoE), it cannot pin memory (clean file
+pages are reclaimable), and it reports progress:
+
+```
+[vugva] cold-tier prefetch: 4480/20707 MiB read ahead (22%)
+```
+
+**Not implemented: pipelined DRAM → VRAM weight streaming.** This is not an
+omission that a few more lines would fix; the llama.cpp execution model excludes
+it:
+
+* every kernel of a decode step is **enqueued before any of them executes**, so
+  the weight pointer of layer *k* must be final at enqueue time. A copy issued
+  "while layer k−1 computes" would therefore have to be part of the graph.
+* a copy placed in the compute stream serializes with the kernels — that is
+  exactly the hybrid path, measured at **0.85–1.2 t/s** on the 27B versus
+  **1.20 t/s** for direct zero-copy reads.
+* a copy on a second stream cannot be joined per layer, because ggml graphs have
+  no event-wait op. The only way to overlap would be to make VUGVA a compute
+  backend, which was tried and reverted (>1000 graph splits, `sched_reserve`
+  crash — see above).
+
+Zero-copy already achieves Algorithm 3's *goal* (keep the CPU out of the data
+plane): the GPU reads warm-tier weights from pinned DRAM over PCIe with the CPU
+idle. Adding promotion on top can only add traffic.
+
+### 3. GPUDirect Storage / IOMMU P2P — not available here (probed, not assumed)
+
+`ggml_backend_vugva_probe_cold_tier()` runs at startup and prints one line:
+
+```
+[VUGVA] cold tier: cufile=yes pageable_access=yes host_ptr_p2p=yes iommu=no -> cold tier: OS page cache (GGUF mmap)
+```
+
+libcufile is installed and the GPU can address host memory, but there is no
+IOMMU group for the NVMe controller, so a cuFile read would bounce through host
+memory — faster-looking code, same traffic. The probe only reports *GDS
+eligible* when libcufile, pageable access **and** an IOMMU are all present.
+Wiring cuFile into the loader is **not implemented**; the cold tier is the page
+cache over the GGUF mapping, as stated.
+
+### 4. The paper's measured numbers are not reproduced
+
+The paper reports +54.8 % throughput and −84.6 % CPU on a non-NVLink multi-GPU
+cluster. This repository's measurements are single-GPU and are reported as such
+(`docs/benchmarks.md`); no number in this repo is derived from, or asserted to
+reproduce, the paper's aggregate figures. The CPU-bypass property that the paper
+quantifies is visible here as scheduler behaviour instead: graph splits = 1 and
+the CPU backend executing no layer, rather than as a percentage.
 
 ## Pool accounting
 

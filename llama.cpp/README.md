@@ -10,7 +10,7 @@ integration patches applied in place.
 | Version | **b12119** |
 | Commit | [`3de52ac38818978d6da8f386eda43a856e53714a`](https://github.com/ggml-org/llama.cpp/commit/3de52ac38818978d6da8f386eda43a856e53714a) (2026-11-04) |
 | License | MIT (see [`LICENSE`](LICENSE)) |
-| Part of | [llama-cpp-VUGVA](..) v0.2.0 |
+| Part of | [llama-cpp-VUGVA](..) v0.2.1 |
 
 ## Read this first
 

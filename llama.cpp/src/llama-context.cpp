@@ -2978,7 +2978,18 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
+#ifdef GGML_USE_VUGVA
+    // dynamic tier: promote this step's warm-tier weights into VRAM (opt-in,
+    // VUGVA_HOT_CACHE_MB) and restore the DRAM pointers after the graph is
+    // enqueued. See ggml-backend-vugva.cpp "Tier manager".
+    ggml_backend_vugva_tier_begin(gf);
+#endif
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+
+#ifdef GGML_USE_VUGVA
+    ggml_backend_vugva_tier_end();
+#endif
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }

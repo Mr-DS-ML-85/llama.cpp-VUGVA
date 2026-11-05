@@ -42,7 +42,7 @@ out-of-memory error.
 
 | Component | Version | Exact reference |
 |---|---|---|
-| **This integration (VUGVA backend for llama.cpp)** | **v0.2.0** | tag `v0.2.0` |
+| **This integration (VUGVA backend for llama.cpp)** | **v0.2.1** | tag `v0.2.1` |
 | **llama.cpp upstream** | **b12119** | commit [`3de52ac3`](https://github.com/ggml-org/llama.cpp/commit/3de52ac38818978d6da8f386eda43a856e53714a) · 2026-11-04 |
 | **VUGVA core (Rust)** | `898e5e1` | [Mr-DS-ML-85/VUGVA](https://github.com/Mr-DS-ML-85/VUGVA) · `898e5e1bfd0259f2a49c39345fe307c85bc3c22c` |
 | **Paper** | July 2026 | **DOI: [10.5281/zenodo.21549808](https://doi.org/10.5281/zenodo.21549808)** |
@@ -54,7 +54,8 @@ self-contained. Git tags:
 
 | Tag | Meaning |
 |---|---|
-| `v0.2.0` | this release |
+| `v0.2.1` | this release (tier manager, cold-tier readahead, GDS probe) |
+| `v0.2.0` | first release on llama.cpp b12119 |
 | `llama.cpp-b12119-3de52ac3` | exact vendored upstream snapshot |
 
 ---
@@ -216,6 +217,9 @@ All knobs are environment variables checked at load time.
 | `VUGVA_PIN_MB` | 50 % of RAM | cap on pinned warm-tier memory |
 | `VUGVA_DRAM_GB` | 32 | DRAM pool size (runtime override of the CMake value) |
 | `VUGVA_AUTO_MOE` | `1` | auto-route experts to CPU/mmap when the model exceeds VRAM |
+| `VUGVA_HOT_CACHE_MB` | `0` (off) | VRAM cache for warm-tier weights with promote-on-use + LRU eviction (needs zerocopy; auto-disabled if VRAM is already full) |
+| `VUGVA_PRELOAD` | `1` | background `POSIX_FADV_WILLNEED` readahead of the GGUF into the page cache (cold tier) |
+| `VUGVA_STATS` | `0` | print tier-cache hit/miss/evict counters every 16 decode steps |
 | `VUGVA_ZEROCOPY` | set by mode | internal; makes the CUDA backend accept `VUGVA_DRAM` |
 | `GGML_OP_OFFLOAD_MIN_BATCH` | 32 | min batch for op offload (llama.cpp) |
 | `GGML_SCHED_DEBUG` | off | scheduler debug output |
@@ -245,7 +249,28 @@ Memory behaviour: zero-copy warm tier on the 27B → **graph splits = 1** (vs 70
 in hybrid). 0.8B forced tier (`VUGVA_VRAM_MB=100`) → 8/25 layers hot, CUDA0
 buffer exactly 99.4 MiB, output identical to the full-GPU run.
 
+Kernel promotion (the dynamic half of the tiering): on a 0.8B model whose static
+budget was forced down to 100 MiB (8/25 layers hot), enabling
+`VUGVA_HOT_CACHE_MB=2048` promotes the 394 MiB warm tier into VRAM on first use
+and takes decode from **25.3 → 149.1 t/s** (full-GPU speed is 202 t/s),
+identical output. A cache smaller than the working set thrashes instead:
+64 MiB gives 18.5 t/s with 2912 evictions in 24 steps. Both directions are
+logged by `VUGVA_STATS=1`.
+
 Reproduction details and methodology are in [docs/benchmarks.md](docs/benchmarks.md).
+
+## Paper vs. implementation
+
+| Paper mechanism | Status |
+|---|---|
+| Three-tier placement, CPU-bypass data plane, Algorithm 1 | implemented |
+| Membrane promotion/eviction (Algorithm 2) | implemented, opt-in (`VUGVA_HOT_CACHE_MB`) |
+| Look-Ahead prefetch (Algorithm 3) | cold-tier readahead implemented (`VUGVA_PRELOAD`); DRAM→VRAM pipelining is architecturally excluded — see [IMPLEMENTATION.md](IMPLEMENTATION.md#2-look-ahead-prefetch-algorithm-3--partially-implemented) |
+| GPUDirect Storage / IOMMU P2P cold tier | not available on this hardware; probed at runtime and reported |
+| Paper's +54.8 % / −84.6 % figures | not reproduced; this repo reports its own single-GPU numbers |
+
+The reasoning and measured numbers behind each row are in
+[IMPLEMENTATION.md](IMPLEMENTATION.md#paper-vs-code-what-is-implemented-what-is-not).
 
 ---
 

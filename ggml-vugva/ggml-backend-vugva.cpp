@@ -25,10 +25,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <inttypes.h>
 #include <mutex>
 #include <new>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
+#include <dlfcn.h>
 #include <sys/mman.h>
 
 #include <cuda_runtime.h>
@@ -898,4 +904,317 @@ extern "C" ggml_backend_reg_t ggml_backend_vugva_reg(void) {
 
     initialized.store(true, std::memory_order_release);
     return &reg;
+}
+
+// ============================================================================
+// Tier manager: runtime promotion / eviction of warm-tier tensors into VRAM
+// ============================================================================
+//
+// Static placement (llama-model.cpp, Algorithm 1) fills VRAM at load time with
+// as much of the model as fits. Anything left in VUGVA_DRAM is read over PCIe
+// (zero-copy) or computed by the CPU (hybrid) for the whole run.
+//
+// This is the *dynamic* half of the paper's membrane: a bounded VRAM cache of
+// warm-tier weight tensors with LRU eviction, populated on first use and reused
+// on every later decode step. It is opt-in (VUGVA_HOT_CACHE_MB=N) because static
+// placement already saturates VRAM in the normal case; the cache only pays off
+// when VRAM is left unused after placement (small VUGVA_VRAM_MB, a conservative
+// reserve, or leftover space after the KV cache was sized).
+//
+// Access is layer-sequential, so the cache is a win only when it holds the
+// whole per-token working set. When it does not, every miss evicts a slot that
+// the next token needs again: the counters below make that thrashing visible
+// instead of silently degrading throughput.
+
+struct vugva_tier_slot {
+    void        * dev      = nullptr; // cudaMalloc'd VRAM copy
+    void        * host     = nullptr; // original DRAM pointer (restored after each step)
+    size_t        bytes    = 0;
+    uint64_t      last_use = 0;
+    ggml_tensor * t        = nullptr;
+};
+
+static std::mutex                        g_tier_mutex;
+static std::unordered_map<ggml_tensor *, vugva_tier_slot *> g_tier_cache;
+static std::vector<ggml_tensor *>        g_tier_used_order;   // dedupe scratch
+static std::unordered_set<ggml_tensor *> g_tier_seen;
+static size_t   g_tier_budget  = 0;
+static size_t   g_tier_bytes   = 0;
+static uint64_t g_tier_tick    = 0;
+static bool     g_tier_enabled = false;
+static bool     g_tier_inited  = false;
+static cudaStream_t g_tier_stream = nullptr;
+
+static uint64_t g_tier_hits = 0, g_tier_misses = 0, g_tier_evictions = 0, g_tier_promotions = 0;
+static size_t   g_tier_promoted_bytes = 0;
+
+static bool vugva_stats_enabled(void) {
+    const char * e = getenv("VUGVA_STATS");
+    return e && *e == '1';
+}
+
+static void vugva_tier_init_once(void) {
+    if (g_tier_inited) {
+        return;
+    }
+    g_tier_inited = true;
+
+    const char * env = getenv("VUGVA_HOT_CACHE_MB");
+    if (env && *env) {
+        char * end = nullptr;
+        unsigned long long mb = strtoull(env, &end, 10);
+        if (end && *end == '\0' && mb > 0) {
+            g_tier_budget = (size_t) mb << 20;
+        }
+    }
+
+    // Promotion needs CUDA to accept the VUGVA buffer type, i.e. zero-copy mode.
+    const bool want_cache = g_tier_budget > 0;
+    const bool zerocopy   = vugva_zerocopy_enabled();
+    g_tier_enabled = want_cache && zerocopy;
+
+    char cold[256] = {0};
+    ggml_backend_vugva_probe_cold_tier(cold, sizeof(cold));
+    fprintf(stderr, "[VUGVA] cold tier: %s\n", cold);
+
+    if (g_tier_enabled) {
+        // Only cache what actually fits: if static placement already saturated
+        // VRAM, promoting into the last few free MiB thrashes (measured 1.20 ->
+        // 0.60 t/s on a 17 GB model). Demand a little headroom beyond the
+        // budget so CUDA allocations and the KV cache keep working.
+        size_t vram_free = 0, vram_total = 0;
+        cudaMemGetInfo(&vram_free, &vram_total);
+        const size_t needed = g_tier_budget + (512ull << 20);
+        if (vram_free < needed) {
+            fprintf(stderr, "[VUGVA] hot cache ignored: only %zu MiB VRAM free, need %zu MiB "
+                            "(static placement already uses the rest)\n",
+                    vram_free / 1024 / 1024, needed / 1024 / 1024);
+            g_tier_enabled = false;
+        }
+    }
+    if (g_tier_enabled) {
+        cudaStreamCreateWithFlags(&g_tier_stream, cudaStreamNonBlocking);
+        fprintf(stderr, "[VUGVA] hot cache: %zu MiB VRAM for warm-tier weights, promote-on-use + LRU eviction\n",
+                g_tier_budget / 1024 / 1024);
+    } else if (want_cache && !zerocopy) {
+        fprintf(stderr, "[VUGVA] hot cache ignored: promotion needs zerocopy mode (VUGVA_MODE=zerocopy)\n");
+    }
+}
+
+static void vugva_tier_evict_one(void) {
+    vugva_tier_slot * victim = nullptr;
+    ggml_tensor *     vt     = nullptr;
+    for (const auto & kv : g_tier_cache) {
+        if (!victim || kv.second->last_use < victim->last_use) {
+            victim = kv.second;
+            vt     = kv.first;
+        }
+    }
+    if (!victim) {
+        return;
+    }
+    // the newest token's compute may still be reading this slot
+    cudaDeviceSynchronize();
+    if (victim->t != nullptr && victim->t->data == victim->dev) {
+        victim->t->data = victim->host; // back to the DRAM tier
+    }
+    cudaFree(victim->dev);
+    g_tier_bytes -= victim->bytes;
+    g_tier_cache.erase(vt);
+    delete victim;
+    g_tier_evictions++;
+}
+
+void ggml_backend_vugva_tier_begin(struct ggml_cgraph * gf) {
+    vugva_tier_init_once();
+    if (!g_tier_enabled || gf == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_tier_mutex);
+    g_tier_tick++;
+
+    // ordered, deduplicated weight tensors the graph reads (layer order)
+    g_tier_used_order.clear();
+    g_tier_seen.clear();
+    for (int i = 0; i < gf->n_nodes; i++) {
+        const ggml_tensor * node = gf->nodes[i];
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            ggml_tensor * t = node->src[j];
+            if (t == nullptr || t->data == nullptr || t->buffer == nullptr) {
+                continue;
+            }
+            // leaf constant only (weights). Inference tensors do not carry
+            // GGML_TENSOR_FLAG_PARAM, so identify them structurally: op NONE
+            // with no sources. Views/rope nodes and the KV cache (allocated on
+            // the CUDA device, not through this buft) are excluded.
+            if (t->op != GGML_OP_NONE || t->src[0] != nullptr) {
+                continue;
+            }
+            if (!ggml_backend_vugva_buft_is_vugva(t->buffer->buft)) {
+                continue;
+            }
+            if (!g_tier_seen.insert(t).second) {
+                continue;
+            }
+            g_tier_used_order.push_back(t);
+        }
+    }
+
+    // look-ahead: every tensor of this step is requested in graph order, so the
+    // copies are issued in the order the kernels will consume them
+    for (ggml_tensor * t : g_tier_used_order) {
+        auto it = g_tier_cache.find(t);
+        if (it != g_tier_cache.end()) {
+            it->second->last_use = g_tier_tick;
+            g_tier_hits++;
+            continue;
+        }
+
+        const size_t need = ggml_nbytes(t);
+        if (need > g_tier_budget) {
+            continue; // never fits; leave it in DRAM
+        }
+        while (g_tier_bytes + need > g_tier_budget && !g_tier_cache.empty()) {
+            const size_t before = g_tier_bytes;
+            vugva_tier_evict_one();
+            if (g_tier_bytes == before) {
+                break;
+            }
+        }
+
+        auto * slot = new vugva_tier_slot();
+        slot->bytes    = need;
+        slot->host     = t->data;
+        slot->last_use = g_tier_tick;
+        slot->t        = t;
+        if (cudaMalloc(&slot->dev, need) != cudaSuccess) {
+            delete slot;
+            continue;
+        }
+        cudaMemcpyAsync(slot->dev, t->data, need, cudaMemcpyHostToDevice, g_tier_stream);
+        g_tier_cache[t] = slot;
+        g_tier_bytes   += need;
+        g_tier_promoted_bytes += need;
+        g_tier_promotions++;
+        g_tier_misses++;
+    }
+
+    // one sync for the whole promotion batch; the copies run concurrently on a
+    // separate stream while the previous decode step drains
+    if (g_tier_promotions > 0) {
+        cudaStreamSynchronize(g_tier_stream);
+    }
+
+    // Point cached tensors at their VRAM copies. The redirection is deliberately
+    // permanent (until eviction) rather than per-step: llama.cpp's CUDA graph
+    // cache keys on source data pointers, so a pointer that moves every step
+    // would disable graph capture entirely. Stable pointers let the first step
+    // after a promotion recapture once and then replay normally.
+    for (ggml_tensor * t : g_tier_used_order) {
+        auto it = g_tier_cache.find(t);
+        if (it == g_tier_cache.end() || t->data == it->second->dev) {
+            continue;
+        }
+        it->second->host = t->data;
+        t->data = it->second->dev;
+    }
+
+    if (vugva_stats_enabled() && (g_tier_tick % 16) == 0) {
+        fprintf(stderr,
+                "[VUGVA] tier stats: step %" PRIu64 " cache %zu/%zu MiB | hit %" PRIu64
+                " miss %" PRIu64 " promote %" PRIu64 " evict %" PRIu64 " promoted %zu MiB\n",
+                g_tier_tick, g_tier_bytes / 1024 / 1024, g_tier_budget / 1024 / 1024,
+                g_tier_hits, g_tier_misses, g_tier_promotions, g_tier_evictions,
+                g_tier_promoted_bytes / 1024 / 1024);
+    }
+}
+
+void ggml_backend_vugva_tier_end(void) {
+    // Promoted tensors keep pointing at their VRAM copies so the CUDA graph can
+    // be replayed across decode steps; eviction (in the next begin()) is what
+    // hands a tensor back to the DRAM tier. Nothing to undo here.
+}
+
+void ggml_backend_vugva_tier_free(void) {
+    std::lock_guard<std::mutex> lock(g_tier_mutex);
+    for (auto & kv : g_tier_cache) {
+        if (kv.second->t != nullptr && kv.second->t->data == kv.second->dev) {
+            kv.second->t->data = kv.second->host;
+        }
+        cudaFree(kv.second->dev);
+        delete kv.second;
+    }
+    g_tier_cache.clear();
+    g_tier_bytes = 0;
+    if (g_tier_stream) {
+        cudaStreamDestroy(g_tier_stream);
+        g_tier_stream = nullptr;
+    }
+    g_tier_enabled = false;
+}
+
+void ggml_backend_vugva_tier_stats(char * out, size_t n) {
+    if (out == nullptr || n == 0) {
+        return;
+    }
+    snprintf(out, n,
+             "hot_cache=%zuMiB used=%zuMiB hits=%" PRIu64 " misses=%" PRIu64
+             " promotions=%" PRIu64 " evictions=%" PRIu64 " promoted=%zuMiB",
+             g_tier_budget / 1024 / 1024, g_tier_bytes / 1024 / 1024,
+             g_tier_hits, g_tier_misses, g_tier_promotions, g_tier_evictions,
+             g_tier_promoted_bytes / 1024 / 1024);
+}
+
+// ============================================================================
+// Capability probe: GPUDirect Storage / IOMMU P2P
+// ============================================================================
+//
+// The paper's cold tier can use GDS (cuFile) to move NVMe data straight into
+// VRAM without a bounce buffer. That needs (a) libcufile, (b) a GPU/driver that
+// allows peer-to-peer with the NVMe controller, and (c) IOMMU support. We probe
+// all three so the answer is measured at runtime instead of assumed; when any
+// is missing the cold tier is the OS page cache over the GGUF mmap.
+void ggml_backend_vugva_probe_cold_tier(char * out, size_t n) {
+    if (out == nullptr || n == 0) {
+        return;
+    }
+
+    int cufile = 0;
+    void * h = dlopen("libcufile.so.0", RTLD_LAZY | RTLD_LOCAL);
+    if (h == nullptr) {
+        h = dlopen("libcufile.so", RTLD_LAZY | RTLD_LOCAL);
+    }
+    if (h != nullptr) {
+        cufile = dlsym(h, "cuFileRead") != nullptr;
+    }
+
+    int pageable_to_device = 0; // HMM / ATS: can kernels walk host page tables?
+    int host_register_p2p  = 0;
+    cudaDeviceGetAttribute(&pageable_to_device, cudaDevAttrPageableMemoryAccess, 0);
+    cudaDeviceGetAttribute(&host_register_p2p,  cudaDevAttrCanUseHostPointerForRegisteredMem, 0);
+
+    int iommu = 0;
+    FILE * f = fopen("/sys/class/iommu", "r");
+    if (f != nullptr) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "dmar") != nullptr || strstr(line, "iommu") != nullptr) {
+                iommu = 1;
+                break;
+            }
+        }
+        fclose(f);
+    }
+
+    snprintf(out, n,
+             "cufile=%s pageable_access=%s host_ptr_p2p=%s iommu=%s -> cold tier: %s",
+             cufile ? "yes" : "no",
+             pageable_to_device ? "yes" : "no",
+             host_register_p2p ? "yes" : "no",
+             iommu ? "yes" : "no",
+             (cufile && iommu) ? "GDS eligible" : "OS page cache (GGUF mmap)");
+    if (h != nullptr) {
+        dlclose(h);
+    }
 }

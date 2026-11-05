@@ -13,6 +13,9 @@ rebuild except the DRAM pool default and the CUDA backend selection.
 | `VUGVA_PIN_MB` | integer MiB | 50 % of RAM | maximum pinned warm-tier memory. Set higher only on a dedicated inference box |
 | `VUGVA_DRAM_GB` | integer GB | 32 (CMake) | DRAM pool size at runtime |
 | `VUGVA_AUTO_MOE` | `0`, `1` | `1` | auto-route sparse experts to CPU/mmap when the model exceeds VRAM |
+| `VUGVA_HOT_CACHE_MB` | integer MiB | `0` | VRAM cache for warm-tier weights; promote on use, LRU evict. Requires `zerocopy`; auto-disabled when static placement already filled VRAM |
+| `VUGVA_PRELOAD` | `0`, `1` | `1` | background readahead of the GGUF into the page cache (cold tier) |
+| `VUGVA_STATS` | `0`, `1` | `0` | print tier-cache counters (hits/misses/promotions/evictions) every 16 decode steps |
 | `VUGVA_ZEROCOPY` | `0`, `1` | set by `VUGVA_MODE` | internal: makes `ggml-cuda` accept `VUGVA_DRAM` buffers |
 | `GGML_OP_OFFLOAD_MIN_BATCH` | integer | 32 | llama.cpp: minimum batch size to offload an op |
 | `GGML_SCHED_DEBUG` | `0`/`1` | `0` | verbose scheduler/graph output |
@@ -45,6 +48,31 @@ run still tries; the allocator refuses unsafe pins and degrades automatically.
 `GGML_CUDA_FA_QUANTS` must include the KV types you intend to use. If
 `-ctk q4_0 -ctv q4_0` is requested but `q4_0-q4_0` was not compiled, CUDA
 FlashAttention has no kernel for that combination.
+
+## Kernel promotion (`VUGVA_HOT_CACHE_MB`)
+
+Static placement fills VRAM at load time. If VRAM is left over afterwards
+(conservative reserve, small `VUGVA_VRAM_MB`, room after the KV cache), that
+memory is dead weight. The tier cache uses it:
+
+```bash
+VUGVA_HOT_CACHE_MB=4096 VUGVA_STATS=1 ./build/llama-cli -m model.gguf -ngl 99 ...
+```
+
+* warm-tier weight tensors are promoted to VRAM on first use and stay there,
+* eviction is LRU under the byte budget,
+* the cache is skipped when fewer than `budget + 512 MiB` of VRAM is free,
+  because promoting into a full card thrashes (measured 1.20 → 0.60 t/s on a
+  27B) — the counter line below tells you which happened:
+
+```text
+[VUGVA] hot cache: 2048 MiB VRAM for warm-tier weights, promote-on-use + LRU eviction
+[VUGVA] tier stats: step 16 cache 394/2048 MiB | hit 3210 miss 214 promote 214 evict 0 promoted 394 MiB
+[VUGVA] hot cache ignored: only 961 MiB VRAM free, need 1024 MiB (static placement already uses the rest)
+```
+
+A cache smaller than the per-token working set shows up as a large `miss`/`evict`
+count and slower decode — that is the honest failure mode, not a bug.
 
 ## CLI flags (`build/llama-cli`)
 

@@ -61,6 +61,28 @@ GGML_API bool ggml_backend_vugva_buft_is_vugva(ggml_backend_buffer_type_t buft);
 /// tier). Returns 0 when unavailable. Safe to call before backend init.
 GGML_API int ggml_backend_vugva_zerocopy_available(void);
 
+// ============================================================================
+// Tier manager (paper: membrane-driven promotion / eviction, Algorithm 3)
+// ============================================================================
+//
+// Static placement fills VRAM at load time (Algorithm 1). The tier manager is
+// the dynamic half: a bounded VRAM cache of warm-tier *weight* tensors, filled
+// on first use and reused on later decode steps, with LRU eviction.
+//
+// Opt-in via VUGVA_HOT_CACHE_MB=N (0 = off) and only active in zerocopy mode,
+// because promotion is only meaningful when the CUDA backend already accepts
+// VUGVA_DRAM tensors. llama.cpp calls begin()/end() around each graph compute;
+// tensors are pointed at their VRAM copies between the two calls and restored
+// afterwards, so nothing outlives a step.
+GGML_API void ggml_backend_vugva_tier_begin(struct ggml_cgraph * gf);
+GGML_API void ggml_backend_vugva_tier_end(void);
+GGML_API void ggml_backend_vugva_tier_free(void);
+GGML_API void ggml_backend_vugva_tier_stats(char * out, size_t n);
+
+/// Describe GDS / IOMMU-P2P availability and what the cold tier therefore is.
+/// Writes a one-line report into `out`.
+GGML_API void ggml_backend_vugva_probe_cold_tier(char * out, size_t n);
+
 #ifdef __cplusplus
 }
 #endif

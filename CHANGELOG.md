@@ -3,6 +3,31 @@
 All notable changes to the VUGVA integration for llama.cpp.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] — 2026-11-05
+
+### Added
+
+- **Tier manager: runtime promotion and LRU eviction of warm-tier weights**
+  (`VUGVA_HOT_CACHE_MB`, opt-in). Called from `llama_context::graph_compute`;
+  promotion is stable across steps so the CUDA-graph cache keeps working, and
+  the cache refuses to enable when static placement already filled VRAM.
+  Measured on a forced 100 MiB budget: 25.3 t/s → **149.1 t/s** (5.9×) with the
+  warm tier promoted; a cache smaller than the working set thrashes (18.5 t/s,
+  2912 evictions) and the counters say so.
+- **Cold-tier look-ahead readahead** (`VUGVA_PRELOAD`, on by default):
+  background `POSIX_FADV_WILLNEED` over the GGUF, paced, memory-safe, with a
+  progress report on exit.
+- **GDS / IOMMU P2P capability probe** printed at startup, so the cold-tier
+  claim is measured rather than assumed (`iommu=no` here ⇒ page cache).
+- `VUGVA_STATS=1`: tier-cache hit/miss/promotion/eviction counters.
+
+### Changed
+
+- `IMPLEMENTATION.md` now has a paper-vs-code table with the measured evidence,
+  and states explicitly that Algorithm 3's DRAM→VRAM pipelining is excluded by
+  llama.cpp's enqueue-whole-graph execution model, and that the paper's
+  aggregate figures are not reproduced.
+
 ## [0.2.0] — 2026-11-05
 
 Upstream: llama.cpp **b12119** (`3de52ac3`, 2026-11-04) · VUGVA core `898e5e1`.

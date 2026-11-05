@@ -3,6 +3,17 @@
 All notable changes to the VUGVA integration for llama.cpp.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Documentation website** on GitHub Pages (`docs/`, source `main:/docs`):
+  landing page, generated per-page docs with sticky table of contents, full-text
+  search over 59 sections, and keyboard shortcuts (`/`, `Ctrl+K`, `?`, `g`+key
+  navigation, `t` theme toggle, `j`/`k` scrolling).
+- `tools/build_docs_site.py`: regenerates `docs/*.html` and
+  `docs/assets/search-index.json` from the Markdown sources with pandoc.
+
 ## [0.2.1] — 2026-11-05
 
 ### Added

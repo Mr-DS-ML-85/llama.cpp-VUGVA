@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VUGVA for llama.cpp — run models larger than your VRAM</title>
+<meta name="description" content="VUGVA turns llama.cpp into a tiered-memory inference engine: VRAM hot, DRAM warm, SSD cold. MoE models 3x bigger than VRAM at 40 tok/s on an 8 GB card.">
+<meta property="og:title" content="VUGVA for llama.cpp">
+<meta property="og:description" content="Tiered VRAM → DRAM → SSD memory for llama.cpp. Run models larger than your GPU.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#9679;</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+
+<header class="site-header">
+  <a class="brand" href="index.html"><span class="brand-mark">V</span> VUGVA <span class="brand-sub">for llama.cpp</span></a>
+  <nav class="site-nav">
+    <a href="index.html" class="active">Home</a>
+    <a href="architecture.html">Architecture</a>
+    <a href="configuration.html">Configuration</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <a href="implementation.html">Paper vs. code</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="search.html">Search</a>
+  </nav>
+  <button class="search-btn" id="search-open" type="button" aria-label="Search documentation">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4.3-4.3"/></svg>
+    <span>Search</span><kbd>/</kbd>
+  </button>
+</header>
+
+<section class="hero" id="content">
+  <div>
+    <p class="eyebrow">Virtual Unified GPU VRAM Architecture</p>
+    <h1>Run models <em>larger than your VRAM</em> — without leaving llama.cpp.</h1>
+    <p class="lead">
+      VUGVA splits the model across three tiers — VRAM hot, pinned DRAM warm, NVMe cold —
+      and keeps CUDA as the compute engine. A 35B mixture-of-experts model runs on an 8 GB
+      card at 20–40 tok/s; a 27B dense model runs at all.
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="architecture.html">Read the docs</a>
+      <a class="btn" href="configuration.html">Configuration</a>
+      <a class="btn" href="https://doi.org/10.5281/zenodo.21549808">Paper (DOI)</a>
+      <a class="btn" href="https://github.com/Mr-DS-ML-85/llama.cpp-VUGVA">GitHub</a>
+    </div>
+    <div class="chips">
+      <span class="chip">llama.cpp b12119</span>
+      <span class="chip">CUDA + UVA zero-copy</span>
+      <span class="chip">MoE fast path</span>
+      <span class="chip">int4 KV cache</span>
+      <span class="chip">AGPL-3.0</span>
+    </div>
+  </div>
+
+  <div class="tiers" aria-label="Memory tiers">
+    <div class="tier hot"><b>VRAM · hot</b><span>8 GB · attention, SSM, shared experts</span></div>
+    <div class="arrow">↑ DMA · PCIe</div>
+    <div class="tier warm"><b>DRAM · warm</b><span>pinned, UVA-mapped · read by CUDA</span></div>
+    <div class="arrow">↑ page cache</div>
+    <div class="tier cold"><b>NVMe · cold</b><span>GGUF mmap · sparse experts</span></div>
+    <p class="muted" style="font-size:12.5px;margin:14px 4px 0">
+      The CPU never touches weight data: in zero-copy mode the GPU reads warm weights
+      directly from pinned DRAM.
+    </p>
+  </div>
+</section>
+
+<section class="section">
+  <h2>Measured, not promised</h2>
+  <p class="sub">RTX 4060 8 GB · 29 GB DDR5 · NVMe · CUDA 13.2 · llama.cpp b12119. Numbers from
+     <a href="benchmarks.html">benchmarks</a>; every run below produced coherent output.</p>
+  <div class="numbers">
+    <div class="stat"><b>2.1 → <span class="up">40</span></b><span>tok/s, 35B MoE on 8 GB VRAM</span></div>
+    <div class="stat"><b><span class="up">5.9×</span></b><span>promotion speed-up (25 → 151 tok/s)</span></div>
+    <div class="stat"><b>1</b><span>graph split in zero-copy mode</span></div>
+    <div class="stat"><b>17.4 GB</b><span>27B dense model, 8 GB card</span></div>
+  </div>
+</section>
+
+<section class="section">
+  <h2>How it works</h2>
+  <p class="sub">A buffer type and a placement policy — never a compute backend.</p>
+  <div class="cards">
+    <a class="card" href="architecture.html#2-placement-algorithm-1">
+      <span class="k">Algorithm 1</span>
+      <h3>Budgeted hot block</h3>
+      <p>Measures free VRAM, keeps a reserve, fills a contiguous layer prefix and spills the
+         remainder to the DRAM tier instead of failing with CUDA OOM.</p>
+    </a>
+    <a class="card" href="architecture.html#3-execution-modes">
+      <span class="k">zerocopy</span>
+      <h3>GPU reads DRAM over PCIe</h3>
+      <p>Pinned, UVA-mapped warm tier is addressable by the CUDA backend, so the scheduler sees
+         one device: one graph split, no copies, CPU idle.</p>
+    </a>
+    <a class="card" href="architecture.html#4-tensor-overrides-and-the-moe-fast-path">
+      <span class="k">MoE</span>
+      <h3>Sparse experts stay in mmap</h3>
+      <p>Only a few experts are active per token, so copying 20 GB is wasted work. Attention
+         stays hot, experts are paged in from the file cache.</p>
+    </a>
+    <a class="card" href="implementation.html#1-promotion--eviction-of-individual-tensors--implemented-opt-in">
+      <span class="k">VUGVA_HOT_CACHE_MB</span>
+      <h3>Runtime promotion cache</h3>
+      <p>Warm weights are promoted into leftover VRAM on first use and LRU-evicted under a
+         byte budget. Counters show hits, misses and thrash.</p>
+    </a>
+    <a class="card" href="configuration.html#environment-variables">
+      <span class="k">Safety</span>
+      <h3>Pinning cannot OOM you</h3>
+      <p>Pinned memory is capped at 50 % of RAM with 2 GiB headroom; a refused pin degrades to
+         pageable DRAM, never to swap soup.</p>
+    </a>
+    <a class="card" href="implementation.html">
+      <span class="k">Honesty</span>
+      <h3>Paper vs. code</h3>
+      <p>What is implemented, what is opt-in, what is architecturally impossible in llama.cpp
+         and what is hardware-gated — with the measurements.</p>
+    </a>
+  </div>
+</section>
+
+<section class="section">
+  <h2>Quick start</h2>
+  <p class="sub">Two builds: the Rust VUGVA core, then llama.cpp against it.</p>
+  <div class="cards">
+    <div class="card wide">
+<pre class="term"><span class="c"># 1 · VUGVA core (DRAM pool + tier bookkeeping)</span>
+git clone https://github.com/Mr-DS-ML-85/VUGVA.git
+cd VUGVA/vugva &amp;&amp; cargo build --release
+
+<span class="c"># 2 · llama.cpp + VUGVA</span>
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON \
+      -DVUGVA_DIR=$PWD/../VUGVA/vugva
+cmake --build build -j
+
+<span class="c"># 3 · a model that fits: nothing changes</span>
+./build/llama-cli -m qwen3.5-0.8b.gguf -ngl 99 "The capital of France is" -n 24
+
+<span class="c"># 4 · a 35B MoE on an 8 GB card: experts go to mmap automatically</span>
+./build/llama-cli -m ornith-35b-moe.gguf -ngl 99 -ctk q4_0 -ctv q4_0 \
+    --temp 0.7 "Explain why the sky is blue" -n 64
+<span class="g">→ decoded 48 tokens in 1.20 s, speed: 40.16 t/s</span></pre>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <h2>Documentation</h2>
+  <p class="sub">Every page is searchable — press <kbd>/</kbd> anywhere, or <kbd>?</kbd> for shortcuts.</p>
+  <div class="cards">
+    <a class="card" href="architecture.html"><h3>Architecture</h3><p>Tiers, Algorithm 1, zero-copy vs hybrid, MoE fast path, memory safety model.</p></a>
+    <a class="card" href="configuration.html"><h3>Configuration</h3><p>All environment variables, CMake options, CLI flags and presets.</p></a>
+    <a class="card" href="benchmarks.html"><h3>Benchmarks</h3><p>Tables, promotion counters, cold-tier readahead, reproduction commands.</p></a>
+    <a class="card" href="implementation.html"><h3>Paper vs. code</h3><p>What the paper claims, what ships, and the evidence behind each row.</p></a>
+    <a class="card" href="troubleshooting.html"><h3>Troubleshooting</h3><p>Slow first pass, pin refusals, KV types, huge split counts, updates.</p></a>
+    <a class="card" href="search.html"><h3>Search</h3><p>Full-text search across all pages, with keyboard navigation.</p></a>
+  </div>
+</section>
+
+<footer class="site-footer">
+  <p><strong>VUGVA</strong> — tiered VRAM → DRAM → SSD memory for llama.cpp.
+     Paper DOI <a href="https://doi.org/10.5281/zenodo.21549808">10.5281/zenodo.21549808</a> ·
+     <a href="https://github.com/Mr-DS-ML-85/VUGVA">core repo</a> ·
+     <a href="https://github.com/Mr-DS-ML-85/llama.cpp-VUGVA">llama.cpp-VUGVA</a></p>
+  <p class="muted">Irfan Mahir · AGPL-3.0 · llama.cpp is MIT · Press <kbd>?</kbd> for keyboard shortcuts.</p>
+</footer>
+
+<div class="overlay" id="search-overlay" hidden>
+  <div class="overlay-panel" role="dialog" aria-modal="true" aria-label="Search documentation">
+    <div class="overlay-bar">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4.3-4.3"/></svg>
+      <input id="search-input" type="search" placeholder="Search docs…  e.g. VUGVA_HOT_CACHE_MB, pin, MoE" autocomplete="off" spellcheck="false">
+      <button class="overlay-close" id="search-close" type="button" aria-label="Close search">esc</button>
+    </div>
+    <ul id="search-results" class="results"></ul>
+    <p class="overlay-hint"><kbd>↑</kbd><kbd>↓</kbd> move · <kbd>enter</kbd> open · <kbd>esc</kbd> close</p>
+  </div>
+</div>
+<div class="overlay" id="help-overlay" hidden>
+  <div class="overlay-panel help" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+    <h2>Keyboard shortcuts</h2>
+    <dl class="keys">
+      <dt><kbd>/</kbd> or <kbd>Ctrl</kbd>+<kbd>K</kbd></dt><dd>open search</dd>
+      <dt><kbd>Esc</kbd></dt><dd>close search / help</dd>
+      <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>move between results</dd>
+      <dt><kbd>Enter</kbd></dt><dd>open selected result</dd>
+      <dt><kbd>g</kbd> then <kbd>h</kbd></dt><dd>home</dd>
+      <dt><kbd>g</kbd> then <kbd>a</kbd></dt><dd>architecture</dd>
+      <dt><kbd>g</kbd> then <kbd>c</kbd></dt><dd>configuration</dd>
+      <dt><kbd>g</kbd> then <kbd>b</kbd></dt><dd>benchmarks</dd>
+      <dt><kbd>g</kbd> then <kbd>i</kbd></dt><dd>paper vs. code</dd>
+      <dt><kbd>g</kbd> then <kbd>t</kbd></dt><dd>troubleshooting</dd>
+      <dt><kbd>g</kbd> then <kbd>s</kbd></dt><dd>search page</dd>
+      <dt><kbd>t</kbd></dt><dd>toggle light / dark theme</dd>
+      <dt><kbd>j</kbd> <kbd>k</kbd></dt><dd>scroll down / up</dd>
+      <dt><kbd>?</kbd></dt><dd>this dialog</dd>
+    </dl>
+    <button class="overlay-close wide" id="help-close" type="button">Close</button>
+  </div>
+</div>
+<script src="assets/site.js" defer></script>
+</body>
+</html>

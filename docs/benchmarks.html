@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Benchmarks · VUGVA for llama.cpp</title>
+<meta name="description" content="Measured throughput, promotion counters and how to reproduce them.">
+<meta property="og:title" content="Benchmarks · VUGVA for llama.cpp">
+<meta property="og:description" content="Measured throughput, promotion counters and how to reproduce them.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#9679;</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="site-header">
+  <a class="brand" href="index.html"><span class="brand-mark">V</span> VUGVA <span class="brand-sub">for llama.cpp</span></a>
+  <nav class="site-nav"><a href="index.html">Home</a>
+<a href="architecture.html">Architecture</a>
+<a href="configuration.html">Configuration</a>
+<a href="benchmarks.html" class="active">Benchmarks</a>
+<a href="implementation.html">Paper vs. code</a>
+<a href="troubleshooting.html">Troubleshooting</a>
+<a href="search.html">Search</a></nav>
+  <button class="search-btn" id="search-open" type="button" aria-label="Search documentation">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4.3-4.3"/></svg>
+    <span>Search</span><kbd>/</kbd>
+  </button>
+</header>
+<main class="layout">
+  <nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+<li class="toc-h2"><a href="#test-machine">Test machine</a></li>
+<li class="toc-h2"><a href="#models">Models</a></li>
+<li class="toc-h2"><a href="#results">Results</a></li>
+<li class="toc-h3"><a href="#qwen35-08b-fits-vram">Qwen3.5 0.8B (fits VRAM)</a></li>
+<li class="toc-h3"><a href="#qwen3-27b-dense-174-gb-exceeds-vram">Qwen3 27B dense (17.4 GB, exceeds VRAM)</a></li>
+<li class="toc-h3"><a href="#ornith-35b-moe-217-gb">Ornith 35B MoE (21.7 GB)</a></li>
+<li class="toc-h3"><a href="#dynamic-promotion-vugva_hot_cache_mb">Dynamic promotion (VUGVA_HOT_CACHE_MB)</a></li>
+<li class="toc-h3"><a href="#cold-tier-readahead-vugva_preload">Cold-tier readahead (VUGVA_PRELOAD)</a></li>
+<li class="toc-h2"><a href="#how-to-reproduce">How to reproduce</a></li>
+<li class="toc-h2"><a href="#notes-on-measurement">Notes on measurement</a></li>
+</ul></nav>
+  <article class="doc" id="content">
+    <p class="crumb"><a href="index.html">Docs</a> / Benchmarks</p>
+    <h1 id="benchmarks">Benchmarks</h1>
+<p>All numbers were measured on the reference machine below, with the vendored llama.cpp b12119 and VUGVA v0.2.0. They are decode throughput after the model is loaded; prompt processing is reported separately where relevant.</p>
+<h2 id="test-machine">Test machine</h2>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Spec</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU</td>
+<td>NVIDIA RTX 4060, 8 GB VRAM (7804 MiB), sm_89</td>
+</tr>
+<tr>
+<td>CPU</td>
+<td>16 threads, x86_64</td>
+</tr>
+<tr>
+<td>RAM</td>
+<td>29 GiB DDR5</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>NVMe, model files on <code>/run/media</code></td>
+</tr>
+<tr>
+<td>OS / driver</td>
+<td>Linux, CUDA 13.2, driver 595.99</td>
+</tr>
+<tr>
+<td>Build</td>
+<td><code>-DGGML_CUDA=ON -DVUGVA_ENABLE=ON -DVUGVA_DRAM_GB=32</code>, Release</td>
+</tr>
+<tr>
+<td>KV FA combos</td>
+<td><code>f16-f16;q8_0-q8_0;q4_0-q4_0;bf16-bf16</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="models">Models</h2>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Size</th>
+<th>Type</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen3.5 0.8B Q4_K_M</td>
+<td>~530 MiB</td>
+<td>dense</td>
+</tr>
+<tr>
+<td>Qwen3 27B "Fable Distill" Q4_K_M</td>
+<td>17.4 GB</td>
+<td>dense</td>
+</tr>
+<tr>
+<td>Ornith-1.5 35B Q4_K_M</td>
+<td>21.7 GB</td>
+<td><code>qwen35moe</code>: 256 experts, 8 active, SSM layers</td>
+</tr>
+</tbody>
+</table>
+<h2 id="results">Results</h2>
+<h3 id="qwen35-08b-fits-vram">Qwen3.5 0.8B (fits VRAM)</h3>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Placement</th>
+<th>Graph splits</th>
+<th>Decode</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-ngl 99</code></td>
+<td>25/25 layers + output hot</td>
+<td>1</td>
+<td>150–188 t/s</td>
+</tr>
+<tr>
+<td><code>VUGVA_VRAM_MB=100</code>, zerocopy</td>
+<td>8/25 hot (99 MiB) + 395 MiB warm</td>
+<td>1</td>
+<td>25–45 t/s</td>
+</tr>
+<tr>
+<td><code>VUGVA_VRAM_MB=100</code>, hybrid</td>
+<td>8/25 hot + 494 MiB warm</td>
+<td>3–35</td>
+<td>56–82 t/s</td>
+</tr>
+</tbody>
+</table>
+<p>The forced-tier runs produce the <strong>same text</strong> as the full-GPU run, which is the correctness check for the warm-tier data path.</p>
+<h3 id="qwen3-27b-dense-174-gb-exceeds-vram">Qwen3 27B dense (17.4 GB, exceeds VRAM)</h3>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Placement</th>
+<th>Graph splits</th>
+<th>Decode</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>auto</code> → zerocopy</td>
+<td>23–24/65 hot (6.3 GB) + 9.5 GB warm</td>
+<td><strong>1</strong></td>
+<td><strong>1.15–1.18 t/s</strong></td>
+</tr>
+<tr>
+<td>hybrid</td>
+<td>14/65 hot + 14.8 GB warm</td>
+<td>70–114</td>
+<td>0.85–1.2 t/s</td>
+</tr>
+<tr>
+<td><code>-ctk q4_0 -ctv q4_0</code>, 4 K ctx</td>
+<td>same</td>
+<td>1</td>
+<td>KV 256 → 72 MiB</td>
+</tr>
+</tbody>
+</table>
+<p>Zero-copy removes 60–110 graph splits and the CPU never computes a layer, but throughput is PCIe-bound and lands on par with hybrid for a dense model. This is expected: a dense model reads every weight per token, and PCIe ~12–25 GB/s is comparable to dual-channel DRAM bandwidth.</p>
+<h3 id="ornith-35b-moe-217-gb">Ornith 35B MoE (21.7 GB)</h3>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Placement</th>
+<th>Graph splits</th>
+<th>Decode</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-ngl 99</code>, whole-layer spill (pre-v0.2.0)</td>
+<td>12/41 hot + 19.8 GB warm</td>
+<td>46–60</td>
+<td>2.1–2.3 t/s</td>
+</tr>
+<tr>
+<td><code>-cmoe</code> (manual), hybrid</td>
+<td>41/41 attention hot (1.3 GB) + experts in DRAM</td>
+<td>82</td>
+<td>2.06 t/s</td>
+</tr>
+<tr>
+<td><code>-cmoe</code>, experts in mmap, <strong>warm page cache</strong></td>
+<td>41/41 attention hot + <code>CPU_Mapped</code> 19.5 GB</td>
+<td>82</td>
+<td><strong>19–36 t/s</strong></td>
+</tr>
+<tr>
+<td>same, <strong>cold page cache</strong></td>
+<td>same</td>
+<td>82</td>
+<td>~4 t/s</td>
+</tr>
+<tr>
+<td>auto (v0.2.0, no flags), warm cache</td>
+<td>same</td>
+<td>82</td>
+<td>24 t/s</td>
+</tr>
+</tbody>
+</table>
+<p>The cold-vs-warm gap is NVMe vs page cache: the first pass reads ~20 GB of expert weights from disk, later tokens hit RAM. This is the expected behaviour of a sparse MoE: the active-expert working set (~0.6 GB/token) is small, so the page cache keeps up once warm.</p>
+<p>Sample run (warm cache):</p>
+<pre class="text"><code>main: decoded 48 tokens in 2.42 s, speed: 19.80 t/s
+llama_perf_context_print: prompt eval time =  431.24 ms / 11 tokens (39.20 ms/token)
+llama_perf_context_print:       eval time = 1934.53 ms / 47 runs  (41.16 ms/token, 24.30 t/s)</code></pre>
+<h3 id="dynamic-promotion-vugva_hot_cache_mb">Dynamic promotion (<code>VUGVA_HOT_CACHE_MB</code>)</h3>
+<p>Qwen3.5 0.8B, static budget forced to <code>VUGVA_VRAM_MB=100</code> (8/25 layers hot, 394 MiB in the DRAM tier), greedy, 24 tokens. Every run produced identical text.</p>
+<table>
+<thead>
+<tr>
+<th><code>VUGVA_HOT_CACHE_MB</code></th>
+<th>promoted</th>
+<th>evictions</th>
+<th>hits</th>
+<th>decode</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0 (static)</td>
+<td>–</td>
+<td>–</td>
+<td>–</td>
+<td>25.3 t/s</td>
+</tr>
+<tr>
+<td>64</td>
+<td>2708 MiB</td>
+<td>2912</td>
+<td>433</td>
+<td>18.5 t/s</td>
+</tr>
+<tr>
+<td>2048</td>
+<td>394 MiB</td>
+<td>0</td>
+<td>3210</td>
+<td><strong>149.1 t/s</strong></td>
+</tr>
+<tr>
+<td>full-GPU reference (<code>-ngl 99</code>, no force)</td>
+<td>–</td>
+<td>–</td>
+<td>–</td>
+<td>202.5 t/s</td>
+</tr>
+</tbody>
+</table>
+<p>Reading: with a cache that holds the working set, promotion recovers most of the full-GPU speed without changing placement. With a cache smaller than the working set, LRU evicts tensors the next step needs again and decode slows down — the counters make it obvious.</p>
+<p>27B dense on a full card: <code>VUGVA_HOT_CACHE_MB=512</code> is refused (<code>only 961 MiB VRAM free, need 1024 MiB</code>) and decode stays at 1.20 t/s. Forced through anyway it ran at 0.60 t/s, which is why the gate exists.</p>
+<h3 id="cold-tier-readahead-vugva_preload">Cold-tier readahead (<code>VUGVA_PRELOAD</code>)</h3>
+<p>The 35B MoE keeps 19.5 GB of experts in mmap'd CPU memory. With preload enabled, the background thread reported <code>4480/20707 MiB read ahead</code> during a 48-token run (it stops when decode finishes, or when <code>MemAvailable</code> drops under 2 GiB). <code>buff/cache</code> grows; RSS does not. On a cold cache this is what turns the first pass from ~4 t/s into ~20-40 t/s.</p>
+<h2 id="how-to-reproduce">How to reproduce</h2>
+<div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 0.8B baseline and forced tier</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./build/llama-cli</span> <span class="at">-m</span> qwen0.8b.gguf <span class="at">-n</span> 32 <span class="at">-ngl</span> 99 <span class="st">&quot;The capital of France is&quot;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="va">VUGVA_VRAM_MB</span><span class="op">=</span>100 <span class="va">VUGVA_MODE</span><span class="op">=</span>zerocopy <span class="dt">\</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>  <span class="ex">./build/llama-cli</span> <span class="at">-m</span> qwen0.8b.gguf <span class="at">-n</span> 32 <span class="at">-ngl</span> 99 <span class="st">&quot;The capital of France is&quot;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="co"># dense spill</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="va">VUGVA_MODE</span><span class="op">=</span>zerocopy <span class="ex">./build/llama-cli</span> <span class="at">-m</span> qwen27b.gguf <span class="at">-n</span> 32 <span class="at">-ngl</span> 99 <span class="st">&quot;Write a story&quot;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="va">VUGVA_MODE</span><span class="op">=</span>hybrid   <span class="ex">./build/llama-cli</span> <span class="at">-m</span> qwen27b.gguf <span class="at">-n</span> 32 <span class="at">-ngl</span> 99 <span class="st">&quot;Write a story&quot;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="co"># dynamic promotion</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="va">VUGVA_VRAM_MB</span><span class="op">=</span>100 <span class="va">VUGVA_MODE</span><span class="op">=</span>zerocopy <span class="va">VUGVA_HOT_CACHE_MB</span><span class="op">=</span>2048 <span class="va">VUGVA_STATS</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>  <span class="ex">./build/llama-cli</span> <span class="at">-m</span> qwen0.8b.gguf <span class="at">-n</span> 24 <span class="at">-ngl</span> 99 <span class="st">&quot;The capital of France is&quot;</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="co"># MoE fast path (automatic)</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="ex">./build/llama-cli</span> <span class="at">-m</span> ornith35b.gguf <span class="at">-n</span> 64 <span class="at">-ngl</span> 99 <span class="at">-ctk</span> q4_0 <span class="at">-ctv</span> q4_0 <span class="dt">\</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span class="at">--temp</span> 0.7 <span class="at">--repeat-penalty</span> 1.1 <span class="st">&quot;Explain why the sky is blue&quot;</span></span></code></pre></div>
+<p>Compare <code>sched_reserve: graph splits</code>, the per-buffer <code>model buffer size</code> lines, and <code>decoded N tokens in T s</code> in stderr.</p>
+<h2 id="notes-on-measurement">Notes on measurement</h2>
+<ul>
+<li>The bundled CLI uses greedy sampling at <code>--temp 0</code>, so repeated runs are identical; the numbers above use <code>--temp 0.7</code> for readable output only.</li>
+<li><code>n_batch</code> defaults to the prompt length; for long prompts set <code>-b</code> explicitly to keep prompt processing representative.</li>
+<li>The first run after a reboot is always slower for mmap'd weights; run each configuration twice and report the second.</li>
+</ul>
+
+    <p class="source-link">Source: <a href="https://github.com/Mr-DS-ML-85/llama.cpp-VUGVA/blob/main/docs/benchmarks.md">edit this page on GitHub</a></p>
+  </article>
+</main>
+<footer class="site-footer">
+  <p><strong>VUGVA</strong> — tiered VRAM → DRAM → SSD memory for llama.cpp.
+     Paper DOI <a href="https://doi.org/10.5281/zenodo.21549808">10.5281/zenodo.21549808</a> ·
+     <a href="https://github.com/Mr-DS-ML-85/llama.cpp-VUGVA">GitHub</a> · <a href="search.html">Search</a></p>
+  <p class="muted">Press <kbd>?</kbd> for keyboard shortcuts.</p>
+</footer>
+<div class="overlay" id="search-overlay" hidden>
+  <div class="overlay-panel" role="dialog" aria-modal="true" aria-label="Search documentation">
+    <div class="overlay-bar">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4.3-4.3"/></svg>
+      <input id="search-input" type="search" placeholder="Search docs…  e.g. VUGVA_HOT_CACHE_MB, pin, MoE"
+             autocomplete="off" spellcheck="false">
+      <button class="overlay-close" id="search-close" type="button" aria-label="Close search">esc</button>
+    </div>
+    <ul id="search-results" class="results"></ul>
+    <p class="overlay-hint"><kbd>↑</kbd><kbd>↓</kbd> move · <kbd>enter</kbd> open · <kbd>esc</kbd> close</p>
+  </div>
+</div>
+<div class="overlay" id="help-overlay" hidden>
+  <div class="overlay-panel help" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+    <h2>Keyboard shortcuts</h2>
+    <dl class="keys">
+      <dt><kbd>/</kbd> or <kbd>Ctrl</kbd>+<kbd>K</kbd></dt><dd>open search</dd>
+      <dt><kbd>Esc</kbd></dt><dd>close search / help</dd>
+      <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>move between results</dd>
+      <dt><kbd>Enter</kbd></dt><dd>open selected result</dd>
+      <dt><kbd>g</kbd> then <kbd>h</kbd></dt><dd>home</dd>
+      <dt><kbd>g</kbd> then <kbd>a</kbd></dt><dd>architecture</dd>
+      <dt><kbd>g</kbd> then <kbd>c</kbd></dt><dd>configuration</dd>
+      <dt><kbd>g</kbd> then <kbd>b</kbd></dt><dd>benchmarks</dd>
+      <dt><kbd>g</kbd> then <kbd>i</kbd></dt><dd>paper vs. code</dd>
+      <dt><kbd>g</kbd> then <kbd>t</kbd></dt><dd>troubleshooting</dd>
+      <dt><kbd>g</kbd> then <kbd>s</kbd></dt><dd>search page</dd>
+      <dt><kbd>t</kbd></dt><dd>toggle light / dark theme</dd>
+      <dt><kbd>?</kbd></dt><dd>this dialog</dd>
+    </dl>
+    <button class="overlay-close wide" id="help-close" type="button">Close</button>
+  </div>
+</div>
+<script src="assets/site.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Troubleshooting · VUGVA for llama.cpp</title>
+<meta name="description" content="Slow first pass, pin refusals, KV cache types, graph splits.">
+<meta property="og:title" content="Troubleshooting · VUGVA for llama.cpp">
+<meta property="og:description" content="Slow first pass, pin refusals, KV cache types, graph splits.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#9679;</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="site-header">
+  <a class="brand" href="index.html"><span class="brand-mark">V</span> VUGVA <span class="brand-sub">for llama.cpp</span></a>
+  <nav class="site-nav"><a href="index.html">Home</a>
+<a href="architecture.html">Architecture</a>
+<a href="configuration.html">Configuration</a>
+<a href="benchmarks.html">Benchmarks</a>
+<a href="implementation.html">Paper vs. code</a>
+<a href="troubleshooting.html" class="active">Troubleshooting</a>
+<a href="search.html">Search</a></nav>
+  <button class="search-btn" id="search-open" type="button" aria-label="Search documentation">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4.3-4.3"/></svg>
+    <span>Search</span><kbd>/</kbd>
+  </button>
+</header>
+<main class="layout">
+  <nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+<li class="toc-h2"><a href="#the-run-is-extremely-slow-on-the-first-pass-then-speeds-up">The run is extremely slow on the first pass, then speeds up</a></li>
+<li class="toc-h2"><a href="#vugva-refusing-to-pin---using-pageable-dram-instead">[VUGVA] refusing to pin ... — using pageable DRAM instead</a></li>
+<li class="toc-h2"><a href="#vugva-zero-copy-allocation-failed--disabling-zero-copy">[VUGVA] zero-copy allocation failed — disabling zero-copy</a></li>
+<li class="toc-h2"><a href="#kv-cache-type-error---ctk-q4_0-fails">KV cache type error / -ctk q4_0 fails</a></li>
+<li class="toc-h2"><a href="#sched_reserve-graph-splits-is-huge-50120">sched_reserve: graph splits is huge (50–120)</a></li>
+<li class="toc-h2"><a href="#gpu-shows-almost-no-vram-used-on-a-moe-model">GPU shows almost no VRAM used on a MoE model</a></li>
+<li class="toc-h2"><a href="#model-loads-but-output-is-garbage">Model loads but output is garbage</a></li>
+<li class="toc-h2"><a href="#unable-to-load-model--oom-at-load">unable to load model / OOM at load</a></li>
+<li class="toc-h2"><a href="#updating-llamacpp">Updating llama.cpp</a></li>
+<li class="toc-h2"><a href="#diagnostic-commands">Diagnostic commands</a></li>
+</ul></nav>
+  <article class="doc" id="content">
+    <p class="crumb"><a href="index.html">Docs</a> / Troubleshooting</p>
+    <h1 id="troubleshooting">Troubleshooting</h1>
+<h2 id="the-run-is-extremely-slow-on-the-first-pass-then-speeds-up">The run is extremely slow on the first pass, then speeds up</h2>
+<p>Expected for mmap'd or pageable weights. The first pass faults pages in from NVMe; the Linux page cache keeps them afterwards. If the model is larger than RAM minus the desktop, the cache cannot hold it and every pass is disk-bound. Options:</p>
+<ul>
+<li>free up RAM (close browsers/IDEs),</li>
+<li>use a smaller quant,</li>
+<li>on a dedicated box, raise <code>VUGVA_PIN_MB</code> so the warm tier is pinned.</li>
+</ul>
+<h2 id="vugva-refusing-to-pin---using-pageable-dram-instead"><code>[VUGVA] refusing to pin ... — using pageable DRAM instead</code></h2>
+<p>The pin cap (50 % of RAM, ≥ 2 GiB headroom) was hit. This is a <strong>safety feature</strong>, not a failure: the run continues with pageable memory and, in zero-copy mode, automatically switches to hybrid. If the machine is dedicated to inference, raise the cap explicitly:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="va">VUGVA_PIN_MB</span><span class="op">=</span>24000 <span class="ex">./build/llama-cli</span> ...</span></code></pre></div>
+<p>Never set it to the full RAM size; leave room for the page cache and the OS.</p>
+<h2 id="vugva-zero-copy-allocation-failed--disabling-zero-copy"><code>[VUGVA] zero-copy allocation failed — disabling zero-copy</code></h2>
+<p>The GPU could not map a host allocation (driver/OOM). The scheduler degrades to the CPU backend for warm layers. Check <code>nvidia-smi</code> and available RAM. A reboot clears stale pinned allocations from killed processes.</p>
+<h2 id="kv-cache-type-error---ctk-q4_0-fails">KV cache type error / <code>-ctk q4_0</code> fails</h2>
+<p>Quantized KV needs a FlashAttention kernel compiled for that combination. Set it at configure time, e.g.:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cmake</span> <span class="at">-B</span> build <span class="at">-DGGML_CUDA</span><span class="op">=</span>ON <span class="dt">\</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>      <span class="at">-DGGML_CUDA_FA_QUANTS</span><span class="op">=</span><span class="st">&quot;f16-f16;q8_0-q8_0;q4_0-q4_0&quot;</span></span></code></pre></div>
+<p><code>-fa on</code> is enabled automatically by the CLI when a non-F16 KV type is requested.</p>
+<h2 id="sched_reserve-graph-splits-is-huge-50120"><code>sched_reserve: graph splits</code> is huge (50–120)</h2>
+<p>Warm layers are being computed by the CPU (<code>hybrid</code>). Every CPU/GPU boundary is a split. Compare with <code>VUGVA_MODE=zerocopy</code>, which normally reports <code>graph splits = 1</code>. A large split count is expected in hybrid mode; it is not an error.</p>
+<h2 id="gpu-shows-almost-no-vram-used-on-a-moe-model">GPU shows almost no VRAM used on a MoE model</h2>
+<p>That is the MoE fast path working: attention/SSM stays hot (~1.3 GB for a 35B), the sparse experts live in mmap'd CPU memory. Check the log:</p>
+<pre class="text"><code>[VUGVA] MoE fast path: sparse experts -&gt; CPU/mmap, attention/SSM stays hot in VRAM
+load_tensors:   CPU_Mapped model buffer size = 19486.84 MiB</code></pre>
+<p>Disable with <code>VUGVA_AUTO_MOE=0</code> to restore whole-layer placement.</p>
+<h2 id="model-loads-but-output-is-garbage">Model loads but output is garbage</h2>
+<ul>
+<li>Confirm the same prompt/seed reproduces with <code>VUGVA_VRAM_MB=100</code> <code>VUGVA_MODE=zerocopy</code> (forced tier) vs. full GPU. If the forced tier matches the full-GPU text, the tiering data path is correct.</li>
+<li>With greedy sampling (<code>--temp 0</code>) small numerical differences can push a model into a repetition loop; try <code>--temp 0.7 --repeat-penalty 1.1</code>.</li>
+<li>The 0.8B tests in <code>docs/benchmarks.md</code> produce identical text in both modes.</li>
+</ul>
+<h2 id="unable-to-load-model--oom-at-load"><code>unable to load model</code> / OOM at load</h2>
+<ul>
+<li>Check free RAM (<code>free -g</code>) and <code>swapon --show</code>. A previous killed process can leave swap full; a reboot or <code>swapoff -a &amp;&amp; swapon -a</code> (root) clears it.</li>
+<li>The warm tier allocation is visible in the load log; if it is near your RAM size, let <code>auto</code> choose hybrid or lower <code>VUGVA_DRAM_GB</code>.</li>
+</ul>
+<h2 id="updating-llamacpp">Updating llama.cpp</h2>
+<p>The vendored source is a plain directory. To move to a new upstream snapshot:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># the upstream git history is kept outside the tree</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> <span class="at">--git-dir</span><span class="op">=</span>../llama-cpp-upstream.git fetch origin master</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> <span class="at">--git-dir</span><span class="op">=</span>../llama-cpp-upstream.git diff <span class="op">&lt;</span>old<span class="op">&gt;</span>..<span class="op">&lt;</span>new<span class="op">&gt;</span> -- <span class="dt">\</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    src/llama-model.cpp src/llama-model-loader.cpp <span class="dt">\</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    ggml/src/ggml-cuda/ggml-cuda.cu examples/simple/simple.cpp</span></code></pre></div>
+<p>Re-apply the VUGVA hunks (they are localized: placement block, loader override hook, CUDA <code>supports_buft</code>, CLI), rebuild, and record the new commit in the README version matrix. Keep the integration tag up to date (<code>llama.cpp-b&lt;build&gt;-&lt;shortsha&gt;</code>).</p>
+<h2 id="diagnostic-commands">Diagnostic commands</h2>
+<div class="sourceCode" id="cb5"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># what placement happened?</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="va">VUGVA_MODE</span><span class="op">=</span>auto <span class="ex">./build/llama-cli</span> ... <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&quot;VUGVA|buffer size|graph splits&quot;</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="co"># scheduler detail</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="va">GGML_SCHED_DEBUG</span><span class="op">=</span>1 <span class="ex">./build/llama-cli</span> ... <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span> <span class="kw">|</span> <span class="fu">head</span> <span class="at">-100</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co"># VRAM and RAM</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> <span class="at">--query-gpu</span><span class="op">=</span>memory.used,memory.free <span class="at">--format</span><span class="op">=</span>csv</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="fu">free</span> <span class="at">-m</span><span class="kw">;</span> <span class="ex">swapon</span> <span class="at">--show</span></span></code></pre></div>
+
+    <p class="source-link">Source: <a href="https://github.com/Mr-DS-ML-85/llama.cpp-VUGVA/blob/main/docs/troubleshooting.md">edit this page on GitHub</a></p>
+  </article>
+</main>
+<footer class="site-footer">
+  <p><strong>VUGVA</strong> — tiered VRAM → DRAM → SSD memory for llama.cpp.
+     Paper DOI <a href="https://doi.org/10.5281/zenodo.21549808">10.5281/zenodo.21549808</a> ·
+     <a href="https://github.com/Mr-DS-ML-85/llama.cpp-VUGVA">GitHub</a> · <a href="search.html">Search</a></p>
+  <p class="muted">Press <kbd>?</kbd> for keyboard shortcuts.</p>
+</footer>
+<div class="overlay" id="search-overlay" hidden>
+  <div class="overlay-panel" role="dialog" aria-modal="true" aria-label="Search documentation">
+    <div class="overlay-bar">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4.3-4.3"/></svg>
+      <input id="search-input" type="search" placeholder="Search docs…  e.g. VUGVA_HOT_CACHE_MB, pin, MoE"
+             autocomplete="off" spellcheck="false">
+      <button class="overlay-close" id="search-close" type="button" aria-label="Close search">esc</button>
+    </div>
+    <ul id="search-results" class="results"></ul>
+    <p class="overlay-hint"><kbd>↑</kbd><kbd>↓</kbd> move · <kbd>enter</kbd> open · <kbd>esc</kbd> close</p>
+  </div>
+</div>
+<div class="overlay" id="help-overlay" hidden>
+  <div class="overlay-panel help" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+    <h2>Keyboard shortcuts</h2>
+    <dl class="keys">
+      <dt><kbd>/</kbd> or <kbd>Ctrl</kbd>+<kbd>K</kbd></dt><dd>open search</dd>
+      <dt><kbd>Esc</kbd></dt><dd>close search / help</dd>
+      <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>move between results</dd>
+      <dt><kbd>Enter</kbd></dt><dd>open selected result</dd>
+      <dt><kbd>g</kbd> then <kbd>h</kbd></dt><dd>home</dd>
+      <dt><kbd>g</kbd> then <kbd>a</kbd></dt><dd>architecture</dd>
+      <dt><kbd>g</kbd> then <kbd>c</kbd></dt><dd>configuration</dd>
+      <dt><kbd>g</kbd> then <kbd>b</kbd></dt><dd>benchmarks</dd>
+      <dt><kbd>g</kbd> then <kbd>i</kbd></dt><dd>paper vs. code</dd>
+      <dt><kbd>g</kbd> then <kbd>t</kbd></dt><dd>troubleshooting</dd>
+      <dt><kbd>g</kbd> then <kbd>s</kbd></dt><dd>search page</dd>
+      <dt><kbd>t</kbd></dt><dd>toggle light / dark theme</dd>
+      <dt><kbd>?</kbd></dt><dd>this dialog</dd>
+    </dl>
+    <button class="overlay-close wide" id="help-close" type="button">Close</button>
+  </div>
+</div>
+<script src="assets/site.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture · VUGVA for llama.cpp</title>
+<meta name="description" content="How the VRAM / DRAM / SSD tiers work, placement, modes, MoE fast path.">
+<meta property="og:title" content="Architecture · VUGVA for llama.cpp">
+<meta property="og:description" content="How the VRAM / DRAM / SSD tiers work, placement, modes, MoE fast path.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#9679;</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="site-header">
+  <a class="brand" href="index.html"><span class="brand-mark">V</span> VUGVA <span class="brand-sub">for llama.cpp</span></a>
+  <nav class="site-nav"><a href="index.html">Home</a>
+<a href="architecture.html" class="active">Architecture</a>
+<a href="configuration.html">Configuration</a>
+<a href="benchmarks.html">Benchmarks</a>
+<a href="implementation.html">Paper vs. code</a>
+<a href="troubleshooting.html">Troubleshooting</a>
+<a href="search.html">Search</a></nav>
+  <button class="search-btn" id="search-open" type="button" aria-label="Search documentation">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4.3-4.3"/></svg>
+    <span>Search</span><kbd>/</kbd>
+  </button>
+</header>
+<main class="layout">
+  <nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+<li class="toc-h2"><a href="#1-the-three-tiers">1. The three tiers</a></li>
+<li class="toc-h2"><a href="#2-placement-algorithm-1">2. Placement (Algorithm 1)</a></li>
+<li class="toc-h2"><a href="#3-execution-modes">3. Execution modes</a></li>
+<li class="toc-h3"><a href="#zerocopy">zerocopy</a></li>
+<li class="toc-h3"><a href="#hybrid">hybrid</a></li>
+<li class="toc-h3"><a href="#auto-default">auto (default)</a></li>
+<li class="toc-h2"><a href="#4-tensor-overrides-and-the-moe-fast-path">4. Tensor overrides and the MoE fast path</a></li>
+<li class="toc-h3"><a href="#auto-moe">Auto-MoE</a></li>
+<li class="toc-h3"><a href="#explicit-overrides">Explicit overrides</a></li>
+<li class="toc-h2"><a href="#5-why-not-a-compute-backend">5. Why not a compute backend?</a></li>
+<li class="toc-h2"><a href="#6-memory-safety-model">6. Memory safety model</a></li>
+<li class="toc-h2"><a href="#7-source-map">7. Source map</a></li>
+</ul></nav>
+  <article class="doc" id="content">
+    <p class="crumb"><a href="index.html">Docs</a> / Architecture</p>
+    <h1 id="architecture">Architecture</h1>
+<p>This document describes how the VUGVA integration works inside llama.cpp, what each layer owns, and why the design looks the way it does.</p>
+<h2 id="1-the-three-tiers">1. The three tiers</h2>
+<pre><code>            ┌──────────────────────────────────────────────┐
+   hot      │ VRAM (8 GB)          ggml CUDA buffer         │  cudaMalloc
+            ├──────────────────────────────────────────────┤
+   warm     │ DRAM (32 GB pool)    VUGVA_DRAM buffer type   │  cudaHostAllocMapped
+            │                      (pinned, UVA-mapped)     │  or pageable mmap
+            ├──────────────────────────────────────────────┤
+   cold     │ NVMe / page cache    fallback host memory     │  mmap, demand paging
+            └──────────────────────────────────────────────┘</code></pre>
+<p>The warm tier is a first-class ggml buffer type (<code>VUGVA_DRAM</code>), not a compute backend. Its memory is allocated from the Rust VUGVA pool (<code>ggml-vugva/vugva-bridge.rs</code> ↔︎ FFI <code>vugva_pool_create/alloc/write/access/…</code>).</p>
+<p>The cold tier is ordinary pageable memory. VUGVA does not need an explicit SSD path: when the DRAM pool cannot hold everything, the allocation becomes pageable and the Linux page cache moves cold pages to NVMe on demand. This is why models larger than the pool still load.</p>
+<h2 id="2-placement-algorithm-1">2. Placement (Algorithm 1)</h2>
+<p>Implemented in <code>llama.cpp/src/llama-model.cpp</code> in <code>load_tensors()</code>.</p>
+<ol type="1">
+<li>Compute <code>budget = free VRAM − reserve</code>, where <code>reserve = max(total_VRAM/8, 1 GiB)</code> and can be overridden with <code>VUGVA_RESERVE_MB</code>; <code>VUGVA_VRAM_MB</code> caps the budget too.</li>
+<li>Sum per-layer weight bytes from the GGUF metadata (<code>blk.N.*</code>), keeping two counters per layer:
+<ul>
+<li><code>layer_bytes</code> — the whole layer,</li>
+<li><code>layer_bytes_dense</code> — the layer without sparse expert tensors.</li>
+</ul></li>
+<li>Compute the output layer cost. Tied models duplicate <code>token_embd</code> into the output buffer (<code>TENSOR_DUPLICATED</code>), so the embedding is counted there.</li>
+<li>Decide the MoE fast path (below).</li>
+<li>Fill the hot tier <strong>in order</strong> — output layer first, then layers <code>i_gpu_start…</code> — stopping at the first layer that does not fit. A contiguous block matters: every gap becomes a CPU↔︎GPU graph split per token.</li>
+<li>Tensors of layers marked warm are created in the warm buft list; the rest in the GPU list. Overrides (see §4) win over both.</li>
+</ol>
+<p>Placement is logged:</p>
+<pre class="text"><code>[VUGVA] mode=zerocopy VRAM budget 6266 MiB (free 7290, reserve 1024)
+        -&gt; 23/65 layers + output on GPU, remainder -&gt; VUGVA_DRAM tier</code></pre>
+<h2 id="3-execution-modes">3. Execution modes</h2>
+<h3 id="zerocopy"><code>zerocopy</code></h3>
+<p>The warm tier is allocated with <code>cudaHostAlloc(cudaHostAllocMapped | cudaHostAllocPortable)</code> and the device alias is obtained with <code>cudaHostGetDevicePointer</code>. Under UVA the device pointer equals the host pointer, so a single <code>tensor-&gt;data</code> is valid on both sides.</p>
+<p><code>ggml-cuda</code> accepts <code>VUGVA_DRAM</code> as a supported buffer type when <code>VUGVA_ZEROCOPY=1</code>, so the scheduler assigns warm-layer nodes to the GPU. The kernels read the weights over PCIe directly. The CPU never touches the weights.</p>
+<p>Result: <strong>one graph split</strong> for the whole model, no H2D copies of weights.</p>
+<p>Cost: warm-tier reads are PCIe-bandwidth-bound. On a dense model this is roughly on par with CPU compute over RAM bandwidth; on a sparse MoE it wins decisively because only the active experts are read.</p>
+<h3 id="hybrid"><code>hybrid</code></h3>
+<p>Warm layers are computed by the CPU backend; only activations cross PCIe. This is the safe fallback when the warm tier does not fit in RAM. It produces many graph splits (one per CPU/GPU boundary), so expect lower throughput.</p>
+<h3 id="auto-default"><code>auto</code> (default)</h3>
+<p>Picks <code>zerocopy</code> when all of the following hold:</p>
+<ul>
+<li>the GPU can map host memory (<code>ggml_backend_vugva_zerocopy_available()</code>),</li>
+<li>the estimated warm tier (<code>model − hot</code>) plus allocator slack fits <code>MemAvailable</code> with a <code>max(4 GiB, warm/4)</code> margin,</li>
+<li>the warm tier is below the pin cap (50 % of RAM by default).</li>
+</ul>
+<p>Otherwise it picks <code>hybrid</code>. The decision is logged.</p>
+<h2 id="4-tensor-overrides-and-the-moe-fast-path">4. Tensor overrides and the MoE fast path</h2>
+<p>llama.cpp resolves each tensor's buffer type in <code>llama_model_loader::create_tensor()</code> in this order:</p>
+<ol type="1">
+<li>explicit <code>tensor_buft_overrides</code> (<code>-ot</code>, <code>-cmoe</code>, <code>-ncmoe</code>),</li>
+<li>VUGVA auto-MoE override (new),</li>
+<li>the layer's buffer-type list (GPU list for hot layers, warm list otherwise).</li>
+</ol>
+<h3 id="auto-moe">Auto-MoE</h3>
+<p>If <code>n_expert &gt; 0</code>, no explicit overrides were given, and the model does not fit the VRAM budget, <code>llama-model.cpp</code> sets <code>ml.auto_cpu_experts</code>. The loader then routes tensors matching</p>
+<pre class="text"><code>\.ffn_(up|down|gate|gate_up)_(ch|)exps</code></pre>
+<p>to <code>ggml_backend_cpu_buffer_type()</code>. With mmap enabled, the CPU buffer type is backed by the GGUF mapping: <strong>zero copies</strong>, zero extra RAM, and only the active experts are touched per token. Shared experts (<code>ffn_*_shexp</code>) are not matched and stay hot.</p>
+<p>Why this is the right metric: a 35B MoE with 256 experts and 8 active touches ~1/32 of the expert stack per token. Streaming the full stack through PCIe or copying it into the DRAM pool is wasted work; paging in the active experts from the (usually cached) file is cheaper.</p>
+<h3 id="explicit-overrides">Explicit overrides</h3>
+<p><code>-cmoe</code> overrides all expert tensors; <code>-ncmoe N</code> overrides the first N layers. In both cases the loader routes them to plain CPU memory (not the DRAM tier), avoiding a full copy of the expert stack into the pool. If a user asks for the DRAM tier explicitly (<code>-ot '…=VUGVA_DRAM'</code> in upstream terms), that is honored instead.</p>
+<h2 id="5-why-not-a-compute-backend">5. Why not a compute backend?</h2>
+<p>An earlier iteration registered VUGVA as a full scheduler backend for warm layers. The CUDA↔︎VUGVA boundary produced <strong>&gt;1000 graph splits</strong> and crashed in <code>sched_reserve</code> on real models. Keeping VUGVA as a buffer type (plus UVA in zero-copy mode) gives the same memory behaviour with none of the scheduling cost. See <code>IMPLEMENTATION.md</code> for the post-mortem.</p>
+<h2 id="6-memory-safety-model">6. Memory safety model</h2>
+<p>The warm tier can be pinned (<code>cudaMallocHost</code> / <code>cudaHostAllocMapped</code>) or pageable. Pinning is the only operation that can take the machine down, so it is gated in the allocator:</p>
+<pre><code>pinned_total + request &lt;= min(VUGVA_PIN_MB, 50% of RAM)
+request + pinned_total + 2 GiB &lt;= MemAvailable</code></pre>
+<p>If either check fails, the allocator refuses the pin and returns pageable memory. If a mapped allocation fails in zero-copy mode, <code>VUGVA_ZEROCOPY</code> is cleared so <code>ggml-cuda</code> stops accepting <code>VUGVA_DRAM</code>, and the scheduler falls back to the CPU. This makes over-commitment a performance problem, never a correctness or stability problem.</p>
+<h2 id="7-source-map">7. Source map</h2>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ggml-vugva/ggml-backend-vugva.cpp</code></td>
+<td>buffer type, DRAM pool bridge, zero-copy alloc, pin safety</td>
+</tr>
+<tr>
+<td><code>ggml-vugva/vugva-bridge.rs</code></td>
+<td>Rust ↔︎ C ABI for the pool</td>
+</tr>
+<tr>
+<td><code>llama.cpp/src/llama-model.cpp</code></td>
+<td>mode selection, budget, hot block, <code>hparams.n_expert</code> logic</td>
+</tr>
+<tr>
+<td><code>llama.cpp/src/llama-model-loader.cpp/.h</code></td>
+<td>tensor → buffer type resolution, auto-MoE, overrides</td>
+</tr>
+<tr>
+<td><code>llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu</code></td>
+<td><code>supports_buft</code> for <code>VUGVA_DRAM</code>, async H2D DMA</td>
+</tr>
+<tr>
+<td><code>llama.cpp/examples/simple/simple.cpp</code></td>
+<td>the bundled <code>llama-cli</code></td>
+</tr>
+<tr>
+<td><code>tests/test_vugva.cpp</code></td>
+<td>end-to-end integration test</td>
+</tr>
+</tbody>
+</table>
+
+    <p class="source-link">Source: <a href="https://github.com/Mr-DS-ML-85/llama.cpp-VUGVA/blob/main/docs/architecture.md">edit this page on GitHub</a></p>
+  </article>
+</main>
+<footer class="site-footer">
+  <p><strong>VUGVA</strong> — tiered VRAM → DRAM → SSD memory for llama.cpp.
+     Paper DOI <a href="https://doi.org/10.5281/zenodo.21549808">10.5281/zenodo.21549808</a> ·
+     <a href="https://github.com/Mr-DS-ML-85/llama.cpp-VUGVA">GitHub</a> · <a href="search.html">Search</a></p>
+  <p class="muted">Press <kbd>?</kbd> for keyboard shortcuts.</p>
+</footer>
+<div class="overlay" id="search-overlay" hidden>
+  <div class="overlay-panel" role="dialog" aria-modal="true" aria-label="Search documentation">
+    <div class="overlay-bar">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4.3-4.3"/></svg>
+      <input id="search-input" type="search" placeholder="Search docs…  e.g. VUGVA_HOT_CACHE_MB, pin, MoE"
+             autocomplete="off" spellcheck="false">
+      <button class="overlay-close" id="search-close" type="button" aria-label="Close search">esc</button>
+    </div>
+    <ul id="search-results" class="results"></ul>
+    <p class="overlay-hint"><kbd>↑</kbd><kbd>↓</kbd> move · <kbd>enter</kbd> open · <kbd>esc</kbd> close</p>
+  </div>
+</div>
+<div class="overlay" id="help-overlay" hidden>
+  <div class="overlay-panel help" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+    <h2>Keyboard shortcuts</h2>
+    <dl class="keys">
+      <dt><kbd>/</kbd> or <kbd>Ctrl</kbd>+<kbd>K</kbd></dt><dd>open search</dd>
+      <dt><kbd>Esc</kbd></dt><dd>close search / help</dd>
+      <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>move between results</dd>
+      <dt><kbd>Enter</kbd></dt><dd>open selected result</dd>
+      <dt><kbd>g</kbd> then <kbd>h</kbd></dt><dd>home</dd>
+      <dt><kbd>g</kbd> then <kbd>a</kbd></dt><dd>architecture</dd>
+      <dt><kbd>g</kbd> then <kbd>c</kbd></dt><dd>configuration</dd>
+      <dt><kbd>g</kbd> then <kbd>b</kbd></dt><dd>benchmarks</dd>
+      <dt><kbd>g</kbd> then <kbd>i</kbd></dt><dd>paper vs. code</dd>
+      <dt><kbd>g</kbd> then <kbd>t</kbd></dt><dd>troubleshooting</dd>
+      <dt><kbd>g</kbd> then <kbd>s</kbd></dt><dd>search page</dd>
+      <dt><kbd>t</kbd></dt><dd>toggle light / dark theme</dd>
+      <dt><kbd>?</kbd></dt><dd>this dialog</dd>
+    </dl>
+    <button class="overlay-close wide" id="help-close" type="button">Close</button>
+  </div>
+</div>
+<script src="assets/site.js" defer></script>
+</body>
+</html>

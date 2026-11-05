@@ -32,3 +32,6 @@ Cargo.lock
 
 # stray cmake cache dir (capital B)
 Build/
+
+# local screenshots / scratch
+.shots/

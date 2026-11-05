@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paper vs. code · VUGVA for llama.cpp</title>
+<meta name="description" content="What the paper claims, what this code does, and the measured evidence.">
+<meta property="og:title" content="Paper vs. code · VUGVA for llama.cpp">
+<meta property="og:description" content="What the paper claims, what this code does, and the measured evidence.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#9679;</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="site-header">
+  <a class="brand" href="index.html"><span class="brand-mark">V</span> VUGVA <span class="brand-sub">for llama.cpp</span></a>
+  <nav class="site-nav"><a href="index.html">Home</a>
+<a href="architecture.html">Architecture</a>
+<a href="configuration.html">Configuration</a>
+<a href="benchmarks.html">Benchmarks</a>
+<a href="implementation.html" class="active">Paper vs. code</a>
+<a href="troubleshooting.html">Troubleshooting</a>
+<a href="search.html">Search</a></nav>
+  <button class="search-btn" id="search-open" type="button" aria-label="Search documentation">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4.3-4.3"/></svg>
+    <span>Search</span><kbd>/</kbd>
+  </button>
+</header>
+<main class="layout">
+  <nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+<li class="toc-h2"><a href="#architecture-current">Architecture (current)</a></li>
+<li class="toc-h2"><a href="#root-causes-fixed-the-original-broken-state">Root causes fixed (the original broken state)</a></li>
+<li class="toc-h2"><a href="#verified-runs-rtx-4060-8-gb--29-gb-ddr5-rtx-4060-sm_89-cuda-132">Verified runs (RTX 4060 8 GB + 29 GB DDR5, RTX 4060 sm_89, CUDA 13.2)</a></li>
+<li class="toc-h3"><a href="#mode-selection-llama-modelcpp-algorithm-1-block">Mode selection (llama-model.cpp, Algorithm-1 block)</a></li>
+<li class="toc-h2"><a href="#paper-vs-code-what-is-implemented-what-is-not">Paper vs. code: what is implemented, what is not</a></li>
+<li class="toc-h3"><a href="#1-promotion--eviction-of-individual-tensors--implemented-opt-in">1. Promotion / eviction of individual tensors — implemented (opt-in)</a></li>
+<li class="toc-h3"><a href="#2-look-ahead-prefetch-algorithm-3--partially-implemented">2. Look-Ahead prefetch (Algorithm 3) — partially implemented</a></li>
+<li class="toc-h3"><a href="#3-gpudirect-storage--iommu-p2p--not-available-here-probed-not-assumed">3. GPUDirect Storage / IOMMU P2P — not available here (probed, not assumed)</a></li>
+<li class="toc-h3"><a href="#4-the-papers-measured-numbers-are-not-reproduced">4. The paper&#x27;s measured numbers are not reproduced</a></li>
+<li class="toc-h2"><a href="#pool-accounting">Pool accounting</a></li>
+</ul></nav>
+  <article class="doc" id="content">
+    <p class="crumb"><a href="index.html">Docs</a> / Paper vs. code</p>
+    <h1 id="vugva-integration--implementation-status">VUGVA Integration — Implementation Status</h1>
+<blockquote>
+<p>Version: integration <strong>0.2.0</strong> · vendored llama.cpp <strong>b12119</strong> (<code>3de52ac3</code>, 2026-11-04) · VUGVA core <code>898e5e1</code> · paper DOI 10.5281/zenodo.21549808. See <code>README.md</code> (version matrix) and <code>docs/</code> for user-facing docs and <code>CHANGELOG.md</code> for the history.</p>
+</blockquote>
+<blockquote>
+<p>This file previously described a plan to make VUGVA a <em>compute</em> backend in the llama.cpp scheduler (<code>supports_op=true</code>, VUGVA claims every op, delegates to CUDA). That approach was tried and reverted: it produced &gt;1000 graph splits and crashed in <code>sched_reserve</code>. The architecture below is what actually ships and is verified to run.</p>
+</blockquote>
+<h2 id="architecture-current">Architecture (current)</h2>
+<p>VUGVA is a <strong>buffer type + memory tier manager</strong>, never a compute backend:</p>
+<pre><code>GGUF file ──mmap──► VUGVA_DRAM buffer (warm tier, pool-accounted)
+                      │
+                      ├─ hot: layers capped to free VRAM ─► CUDA0 buffer (VRAM)
+                      ├─ warm: everything else          ─► VUGVA_DRAM (page cache / pinned)
+                      └─ cold: pool budget exceeded     ─► SSD via page cache (mmap file)
+
+compute: CUDA runs the hot-tier layers; DRAM-tier weights are read directly by
+the CPU backend; llama.cpp&#39;s op_offload moves small/batched ops to CUDA.</code></pre>
+<p>Key properties enforced in <code>ggml-vugva/ggml-backend-vugva.cpp</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Hook</th>
+<th>Behavior</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>dev.supports_op</code></td>
+<td><code>true</code></td>
+<td>consulted only by <code>weight_buft_supported()</code>/<code>select_buft()</code> for <strong>weight placement</strong>. VUGVA is skipped as a scheduler backend in <code>llama-context.cpp</code> and has <code>graph_compute = NULL</code>, so it never executes ops.</td>
+</tr>
+<tr>
+<td><code>dev.get_buffer_type</code></td>
+<td>singleton per device</td>
+<td>llama.cpp compares buffer-type <strong>pointers</strong> (<code>is_default_buft</code>); a fresh instance per call broke the mmap zero-copy import and leaked.</td>
+</tr>
+<tr>
+<td><code>dev.get_host_buffer_type</code></td>
+<td><code>NULL</code></td>
+<td>otherwise llama.cpp's "avoid host buffers when using mmap" rule rewrites every VUGVA selection back to the plain CPU buffer.</td>
+</tr>
+<tr>
+<td><code>buft.alloc_buffer</code></td>
+<td>pool-accounted (<code>vugva_alloc</code>), <code>cudaMallocHost</code> storage, anonymous-mmap fallback</td>
+<td>page-locked memory ⇒ scheduler H2D copies are true DMA (paper §5.1); allocation must not fail when the pool is merely over budget.</td>
+</tr>
+<tr>
+<td><code>dev.buffer_from_host_ptr</code></td>
+<td>wraps the GGUF mmap range</td>
+<td>default load mode: zero-copy weights, page cache = DRAM tier, file = cold tier. Over-budget imports are accepted with a logged warning.</td>
+</tr>
+<tr>
+<td><code>buft.get_max_size</code></td>
+<td><code>SIZE_MAX</code></td>
+<td>used by ggml to chunk allocations, not as a capacity gate.</td>
+</tr>
+</tbody>
+</table>
+<p>Placement changes in <code>llama.cpp/src/llama-model.cpp</code>:</p>
+<ol type="1">
+<li><p><code>make_gpu_buft_list()</code> does <strong>not</strong> prepend VUGVA (an earlier revision did — that sent even <code>-ngl</code> layers to DRAM and left the GPU idle). VUGVA enters as the first entry of <code>make_cpu_buft_list()</code> via the generic ACCEL loop, which is appended as fallback: GPU layers keep CUDA first, everything else lands in VUGVA_DRAM (input layer, non-offloaded layers, KV of those layers).</p></li>
+<li><p><strong>Algorithm 1 / VRAM budget</strong> in <code>load_tensors()</code>: before assigning layers, free VRAM minus a reserve (<code>max(1 GiB, total/8)</code>) is compared against per-layer weight sizes (<code>blk.N.*</code> from the GGUF). Requested layers that no longer fit fall back to the DRAM tier instead of aborting with <code>cudaMalloc failed: out of memory</code>. The output layer is budgeted first (largest matmul per token). Logged as:</p>
+<pre><code>load_tensors: [VUGVA] VRAM budget 5973 MiB (free 6997, reserve 1024) -&gt; 10/41 layers + output on GPU, remainder -&gt; VUGVA_DRAM tier (requested -ngl 99)</code></pre></li>
+</ol>
+<h2 id="root-causes-fixed-the-original-broken-state">Root causes fixed (the original broken state)</h2>
+<ol type="1">
+<li><code>dev.supports_op</code> returned <code>false</code> → every tensor rejected <code>VUGVA_DRAM</code> → weights fell through to the CUDA buffer type → one contiguous <strong>19.9 GB <code>cudaMalloc</code> → OOM</strong> on the 8 GB card (the reported 35B failure).</li>
+<li><code>get_buffer_type</code> allocated a <strong>new instance per call</strong> → <code>is_default_buft</code> never matched → mmap zero-copy import path was dead, plus a leak per call.</li>
+<li><code>make_gpu_buft_list()</code> prepended VUGVA <strong>before CUDA</strong> → with (1) fixed, all weights (including <code>-ngl</code> layers) would have gone to DRAM, GPU idle.</li>
+<li><code>get_host_buffer_type()</code> returned VUGVA's own buft → llama.cpp's mmap rule silently rewrote VUGVA selections to the CPU buffer.</li>
+<li><code>vugva_alloc</code> failure (pool over budget) hard-failed the import → any model larger than the pool could not load at all.</li>
+<li><code>get_max_size()</code> returned the 32 GB pool size (ggml uses it to chunk).</li>
+<li><code>tests/test_vugva.cpp</code> built a <code>std::vector</code> from the <strong>negated</strong> return of <code>llama_tokenize</code> → <code>std::length_error</code> abort; it also forced <code>n_gpu_layers=0</code>.</li>
+<li>CMake <code>VUGVA_DRAM_GB</code> was never wired into the backend (32 GB hardcoded), and the <code>vugva_test</code> target referenced by README/CI/CONTRIBUTING did not exist.</li>
+</ol>
+<h2 id="verified-runs-rtx-4060-8-gb--29-gb-ddr5-rtx-4060-sm_89-cuda-132">Verified runs (RTX 4060 8 GB + 29 GB DDR5, RTX 4060 sm_89, CUDA 13.2)</h2>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>vugva_test</code> (0.8B)</td>
+<td><code>ALL TESTS PASSED</code>, 64 tokens, 215 tok/s</td>
+</tr>
+<tr>
+<td>0.8B Q4_K_M, <code>-ngl 99</code></td>
+<td>25/25 layers + output hot, graph splits=1, ~150–185 tok/s</td>
+</tr>
+<tr>
+<td>0.8B Q4_K_M, <code>VUGVA_VRAM_MB=100</code>, zerocopy</td>
+<td>8/25 hot (99 MiB VRAM), 395 MiB warm, graph splits=1, 25–45 tok/s, output identical to full-GPU</td>
+</tr>
+<tr>
+<td>27B Q4_K_M (17.4 GB dense), <code>-ngl 99</code> auto→zerocopy</td>
+<td>24/65 layers hot (6.3 GB), 9.5 GB warm, <strong>graph splits=1</strong>, 1.15–1.18 tok/s, coherent</td>
+</tr>
+<tr>
+<td>27B Q4_K_M, <code>-ngl 99</code> hybrid</td>
+<td>14/65 hot, graph splits=70/114, 0.85–1.2 tok/s</td>
+</tr>
+<tr>
+<td>27B Q4_K_M, <code>-ctk q4_0 -ctv q4_0</code>, ctx 4096</td>
+<td>KV cache 256 MiB → 72 MiB, same placement</td>
+</tr>
+<tr>
+<td>35B MoE Q4_K_M (21.7 GB), <code>-ngl 99</code> hybrid</td>
+<td>12/41 hot, 19.8 GB VUGVA_DRAM, graph splits=46–60, 2.1–2.3 tok/s</td>
+</tr>
+<tr>
+<td>35B MoE, <code>-ngl 99 -cmoe -ctk q4_0 -ctv q4_0</code>, warm cache</td>
+<td>41/41 attention layers hot (1.3 GB VRAM), experts mmap'd (<code>CPU_Mapped</code> 19.5 GB, no copy), graph splits=82, <strong>27–36 tok/s</strong></td>
+</tr>
+<tr>
+<td>35B MoE, same, cold page cache</td>
+<td>~4 tok/s (NVMe-bound first pass)</td>
+</tr>
+<tr>
+<td>35B MoE, <code>VUGVA_MODE=zerocopy</code> forced</td>
+<td>pin refused (&gt;50% RAM) → zero-copy auto-disabled → pageable DRAM + hybrid, exit 0 (no OOM)</td>
+</tr>
+<tr>
+<td>35B with <code>VUGVA_DRAM_GB=16</code> (&lt; model size)</td>
+<td>exit 0, cold-tier warning logged, still runs</td>
+</tr>
+</tbody>
+</table>
+<h3 id="mode-selection-llama-modelcpp-algorithm-1-block">Mode selection (llama-model.cpp, Algorithm-1 block)</h3>
+<ul>
+<li>Hot tier is a <strong>contiguous prefix</strong> of the requested layers (no holes, so no extra graph splits); the output layer is budgeted first and its tied embedding is counted (llama.cpp duplicates <code>token_embd</code> into the output buffer via <code>TENSOR_DUPLICATED</code>).</li>
+<li>Tensors rewritten by <code>--cpu-moe</code> / <code>-ncmoe</code> (<code>tensor_buft_overrides</code>) are excluded from the hot-tier budget, so MoE models can keep all attention/SSM layers in VRAM.</li>
+<li><code>auto</code> picks <code>zerocopy</code> only when the estimated warm tier fits in RAM with a 25%/4 GiB margin <strong>and</strong> stays below 50% of physical RAM; otherwise <code>hybrid</code>.</li>
+<li>Pinned allocations are capped (50% RAM, ≥2 GiB headroom, <code>VUGVA_PIN_MB</code>) and a failed mapped allocation downgrades the run to <code>hybrid</code> instead of crashing.</li>
+<li>CPU-buft overrides (<code>--cpu-moe</code>) now use the plain CPU buffer (mmap-backed) instead of the VUGVA DRAM tier, avoiding a full copy of the expert stack.</li>
+</ul>
+<h2 id="paper-vs-code-what-is-implemented-what-is-not">Paper vs. code: what is implemented, what is not</h2>
+<p>Three of the paper's mechanisms are implemented; one is partially implemented; one cannot be implemented in llama.cpp's execution model, and one is hardware gated. Everything below is reproduced on the reference machine (RTX 4060 8 GB, 29 GB RAM, NVMe, CUDA 13.2) with the numbers from <code>docs/benchmarks.md</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Paper claim</th>
+<th>Status</th>
+<th>Where</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Three-tier placement VRAM → DRAM → SSD (§3.1)</td>
+<td><strong>implemented</strong></td>
+<td><code>llama-model.cpp</code> Algorithm 1 block, <code>VUGVA_DRAM</code> buft</td>
+</tr>
+<tr>
+<td>CPU-bypass data plane (§5.1)</td>
+<td><strong>implemented</strong> (load + zero-copy reads)</td>
+<td>mapped pinned DRAM + UVA</td>
+</tr>
+<tr>
+<td>Algorithm 1: static placement into the hot tier</td>
+<td><strong>implemented</strong></td>
+<td>contiguous hot prefix, tied-embedding aware</td>
+</tr>
+<tr>
+<td>Algorithm 2: membrane-driven promotion / eviction</td>
+<td><strong>implemented, opt-in</strong></td>
+<td><code>VUGVA_HOT_CACHE_MB</code>, tier manager below</td>
+</tr>
+<tr>
+<td>Algorithm 3: look-ahead prefetch</td>
+<td><strong>partially implemented</strong> (cold tier)</td>
+<td><code>VUGVA_PRELOAD</code>; DRAM→VRAM pipelining deliberately absent</td>
+</tr>
+<tr>
+<td>GPUDirect Storage / IOMMU P2P cold tier</td>
+<td><strong>not available on this hardware</strong>, probed at runtime</td>
+<td><code>ggml_backend_vugva_probe_cold_tier</code></td>
+</tr>
+<tr>
+<td>Paper's aggregate numbers (+54.8% throughput, −84.6% CPU)</td>
+<td><strong>not reproduced</strong>; different hardware and workload</td>
+<td>our own table below</td>
+</tr>
+</tbody>
+</table>
+<h3 id="1-promotion--eviction-of-individual-tensors--implemented-opt-in">1. Promotion / eviction of individual tensors — implemented (opt-in)</h3>
+<p><code>ggml-vugva/ggml-backend-vugva.cpp</code> → <em>Tier manager</em>, called from <code>llama_context::graph_compute</code> (<code>tier_begin</code> before the scheduler runs, <code>tier_end</code> after it is enqueued).</p>
+<ul>
+<li>On each decode step the graph's leaf weight tensors in <code>VUGVA_DRAM</code> are walked <strong>in graph (layer) order</strong>, which is the paper's look-ahead order.</li>
+<li>A miss allocates a VRAM slot, <code>cudaMemcpyAsync</code>s the tensor on a dedicated non-blocking stream and redirects <code>tensor-&gt;data</code> to it. A hit just bumps the LRU clock. Under budget pressure the least-recently-used slot is evicted and its tensor is pointed back at DRAM.</li>
+<li>Redirection is <strong>stable across steps</strong>: llama.cpp's CUDA-graph cache keys on source pointers, so moving a pointer every step would disable graph capture. Pointers change only on promotion and eviction.</li>
+<li>The cache refuses to enable when static placement already filled VRAM (<code>VUGVA_HOT_CACHE_MB</code> &gt; free VRAM ⇒ warn and stay static), because that pathological case is measurable: 27B, 17.4 GB, 512 MiB cache on a full card ran at <strong>0.60 t/s vs 1.20 t/s</strong> static. With the gate, the same command reports <code>hot cache ignored: only 961 MiB VRAM free</code> and keeps 1.20 t/s.</li>
+</ul>
+<p>Measured effect (Qwen3.5 0.8B Q4_K_M, static budget forced to 100 MiB so only 8/25 layers are hot, greedy, 24 tokens, identical output text in all runs):</p>
+<table>
+<thead>
+<tr>
+<th><code>VUGVA_HOT_CACHE_MB</code></th>
+<th>promoted</th>
+<th>evictions</th>
+<th>decode</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0 (static only)</td>
+<td>–</td>
+<td>–</td>
+<td>25.3 t/s</td>
+</tr>
+<tr>
+<td>64</td>
+<td>2708 MiB</td>
+<td>2912</td>
+<td><strong>18.5 t/s</strong> (thrashing, as expected when the cache is smaller than the working set)</td>
+</tr>
+<tr>
+<td>2048</td>
+<td>394 MiB</td>
+<td>0</td>
+<td><strong>149.1 t/s</strong> (5.9× over static, ≈ full-GPU speed of 202 t/s)</td>
+</tr>
+</tbody>
+</table>
+<p>So the membrane behaves as the paper describes: gain when the cache holds the per-token working set, loss when it does not — and the loss is visible in the counters (<code>VUGVA_STATS=1</code>) instead of hiding as "it feels slow".</p>
+<h3 id="2-look-ahead-prefetch-algorithm-3--partially-implemented">2. Look-Ahead prefetch (Algorithm 3) — partially implemented</h3>
+<p><strong>Implemented: cold-tier readahead.</strong> <code>VUGVA_PRELOAD</code> (default on) starts a background thread after the model loads and issues <code>posix_fadvise(..., POSIX_FADV_WILLNEED)</code> over the GGUF in 64 MiB chunks, 20 ms apart, stopping below 2 GiB of <code>MemAvailable</code>. It is the tier that actually reads from NVMe (the experts of a sparse MoE), it cannot pin memory (clean file pages are reclaimable), and it reports progress:</p>
+<pre><code>[vugva] cold-tier prefetch: 4480/20707 MiB read ahead (22%)</code></pre>
+<p><strong>Not implemented: pipelined DRAM → VRAM weight streaming.</strong> This is not an omission that a few more lines would fix; the llama.cpp execution model excludes it:</p>
+<ul>
+<li>every kernel of a decode step is <strong>enqueued before any of them executes</strong>, so the weight pointer of layer <em>k</em> must be final at enqueue time. A copy issued "while layer k−1 computes" would therefore have to be part of the graph.</li>
+<li>a copy placed in the compute stream serializes with the kernels — that is exactly the hybrid path, measured at <strong>0.85–1.2 t/s</strong> on the 27B versus <strong>1.20 t/s</strong> for direct zero-copy reads.</li>
+<li>a copy on a second stream cannot be joined per layer, because ggml graphs have no event-wait op. The only way to overlap would be to make VUGVA a compute backend, which was tried and reverted (&gt;1000 graph splits, <code>sched_reserve</code> crash — see above).</li>
+</ul>
+<p>Zero-copy already achieves Algorithm 3's <em>goal</em> (keep the CPU out of the data plane): the GPU reads warm-tier weights from pinned DRAM over PCIe with the CPU idle. Adding promotion on top can only add traffic.</p>
+<h3 id="3-gpudirect-storage--iommu-p2p--not-available-here-probed-not-assumed">3. GPUDirect Storage / IOMMU P2P — not available here (probed, not assumed)</h3>
+<p><code>ggml_backend_vugva_probe_cold_tier()</code> runs at startup and prints one line:</p>
+<pre><code>[VUGVA] cold tier: cufile=yes pageable_access=yes host_ptr_p2p=yes iommu=no -&gt; cold tier: OS page cache (GGUF mmap)</code></pre>
+<p>libcufile is installed and the GPU can address host memory, but there is no IOMMU group for the NVMe controller, so a cuFile read would bounce through host memory — faster-looking code, same traffic. The probe only reports <em>GDS eligible</em> when libcufile, pageable access <strong>and</strong> an IOMMU are all present. Wiring cuFile into the loader is <strong>not implemented</strong>; the cold tier is the page cache over the GGUF mapping, as stated.</p>
+<h3 id="4-the-papers-measured-numbers-are-not-reproduced">4. The paper's measured numbers are not reproduced</h3>
+<p>The paper reports +54.8 % throughput and −84.6 % CPU on a non-NVLink multi-GPU cluster. This repository's measurements are single-GPU and are reported as such (<code>docs/benchmarks.md</code>); no number in this repo is derived from, or asserted to reproduce, the paper's aggregate figures. The CPU-bypass property that the paper quantifies is visible here as scheduler behaviour instead: graph splits = 1 and the CPU backend executing no layer, rather than as a percentage.</p>
+<h2 id="pool-accounting">Pool accounting</h2>
+<p>The Rust <code>TieredPool</code> (<code>/home/irfan/Desktop/VUGVA/vugva</code>) provides NUMA-local registration and bookkeeping (<code>vugva_alloc</code>/<code>vugva_dealloc</code>/<code>vugva_pool_info</code>); the ggml buffer owns the actual storage (mmap import or <code>cudaMallocHost</code>). Pool size: <code>cmake -DVUGVA_DRAM_GB=N</code>, runtime override <code>VUGVA_DRAM_GB=N</code>. Note: the pool attempts a whole-range <code>cuMemHostRegister</code> at creation; on a 32 GB machine registering 32 GB fails harmlessly (bookkeeping still works).</p>
+
+    <p class="source-link">Source: <a href="https://github.com/Mr-DS-ML-85/llama.cpp-VUGVA/blob/main/IMPLEMENTATION.md">edit this page on GitHub</a></p>
+  </article>
+</main>
+<footer class="site-footer">
+  <p><strong>VUGVA</strong> — tiered VRAM → DRAM → SSD memory for llama.cpp.
+     Paper DOI <a href="https://doi.org/10.5281/zenodo.21549808">10.5281/zenodo.21549808</a> ·
+     <a href="https://github.com/Mr-DS-ML-85/llama.cpp-VUGVA">GitHub</a> · <a href="search.html">Search</a></p>
+  <p class="muted">Press <kbd>?</kbd> for keyboard shortcuts.</p>
+</footer>
+<div class="overlay" id="search-overlay" hidden>
+  <div class="overlay-panel" role="dialog" aria-modal="true" aria-label="Search documentation">
+    <div class="overlay-bar">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4.3-4.3"/></svg>
+      <input id="search-input" type="search" placeholder="Search docs…  e.g. VUGVA_HOT_CACHE_MB, pin, MoE"
+             autocomplete="off" spellcheck="false">
+      <button class="overlay-close" id="search-close" type="button" aria-label="Close search">esc</button>
+    </div>
+    <ul id="search-results" class="results"></ul>
+    <p class="overlay-hint"><kbd>↑</kbd><kbd>↓</kbd> move · <kbd>enter</kbd> open · <kbd>esc</kbd> close</p>
+  </div>
+</div>
+<div class="overlay" id="help-overlay" hidden>
+  <div class="overlay-panel help" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+    <h2>Keyboard shortcuts</h2>
+    <dl class="keys">
+      <dt><kbd>/</kbd> or <kbd>Ctrl</kbd>+<kbd>K</kbd></dt><dd>open search</dd>
+      <dt><kbd>Esc</kbd></dt><dd>close search / help</dd>
+      <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>move between results</dd>
+      <dt><kbd>Enter</kbd></dt><dd>open selected result</dd>
+      <dt><kbd>g</kbd> then <kbd>h</kbd></dt><dd>home</dd>
+      <dt><kbd>g</kbd> then <kbd>a</kbd></dt><dd>architecture</dd>
+      <dt><kbd>g</kbd> then <kbd>c</kbd></dt><dd>configuration</dd>
+      <dt><kbd>g</kbd> then <kbd>b</kbd></dt><dd>benchmarks</dd>
+      <dt><kbd>g</kbd> then <kbd>i</kbd></dt><dd>paper vs. code</dd>
+      <dt><kbd>g</kbd> then <kbd>t</kbd></dt><dd>troubleshooting</dd>
+      <dt><kbd>g</kbd> then <kbd>s</kbd></dt><dd>search page</dd>
+      <dt><kbd>t</kbd></dt><dd>toggle light / dark theme</dd>
+      <dt><kbd>?</kbd></dt><dd>this dialog</dd>
+    </dl>
+    <button class="overlay-close wide" id="help-close" type="button">Close</button>
+  </div>
+</div>
+<script src="assets/site.js" defer></script>
+</body>
+</html>

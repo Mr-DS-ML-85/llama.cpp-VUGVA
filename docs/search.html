@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Search · VUGVA for llama.cpp</title>
+<meta name="description" content="Full-text search across the VUGVA documentation for llama.cpp.">
+<meta property="og:title" content="VUGVA for llama.cpp">
+<meta property="og:description" content="Tiered VRAM → DRAM → SSD memory for llama.cpp. Run models larger than your GPU.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#9679;</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+
+<a class="skip" href="#content">Skip to content</a>
+
+<header class="site-header">
+  <a class="brand" href="index.html"><span class="brand-mark">V</span> VUGVA <span class="brand-sub">for llama.cpp</span></a>
+  <nav class="site-nav">
+    <a href="index.html">Home</a>
+    <a href="architecture.html">Architecture</a>
+    <a href="configuration.html">Configuration</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <a href="implementation.html">Paper vs. code</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="search.html" class="active">Search</a>
+  </nav>
+  <button class="search-btn" id="search-open" type="button" aria-label="Search documentation">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4.3-4.3"/></svg>
+    <span>Search</span><kbd>/</kbd>
+  </button>
+</header>
+
+
+<main class="layout single" id="content">
+  <article class="doc">
+    <h1>Search the documentation</h1>
+    <p class="sub">Full text over every page: variables, flags, error messages, measured numbers.
+       Results open at the exact section.</p>
+    <div class="overlay-panel inline-search" role="dialog" aria-label="Search documentation">
+      <div class="overlay-bar">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4.3-4.3"/></svg>
+        <input id="search-input" type="search" placeholder="Search docs…  e.g. VUGVA_HOT_CACHE_MB, pin, MoE, splits" autocomplete="off" spellcheck="false" autofocus>
+      </div>
+      <ul id="search-results" class="results"></ul>
+      <p class="overlay-hint"><kbd>↑</kbd><kbd>↓</kbd> move · <kbd>enter</kbd> open ·
+        <kbd>esc</kbd> clear · <kbd>?</kbd> shortcuts ·
+        <a href="index.html">back home</a></p>
+    </div>
+    <p class="muted" style="margin-top:26px;font-size:13.5px">
+      The index is generated from the documentation sources at build time
+      (<code>tools/build_docs_site.py</code>), so it is always in sync with this site.
+    </p>
+  </article>
+</main>
+
+<footer class="site-footer">
+  <p><strong>VUGVA</strong> — tiered VRAM → DRAM → SSD memory for llama.cpp.
+     Paper DOI <a href="https://doi.org/10.5281/zenodo.21549808">10.5281/zenodo.21549808</a> ·
+     <a href="https://github.com/Mr-DS-ML-85/VUGVA">core repo</a> ·
+     <a href="https://github.com/Mr-DS-ML-85/llama.cpp-VUGVA">llama.cpp-VUGVA</a></p>
+  <p class="muted">Irfan Mahir · AGPL-3.0 · Press <kbd>?</kbd> for keyboard shortcuts.</p>
+</footer>
+
+
+
+
+
+<div class="overlay" id="help-overlay" hidden>
+  <div class="overlay-panel help" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+    <h2>Keyboard shortcuts</h2>
+    <dl class="keys">
+      <dt><kbd>/</kbd> or <kbd>Ctrl</kbd>+<kbd>K</kbd></dt><dd>open search</dd>
+      <dt><kbd>Esc</kbd></dt><dd>close search / help</dd>
+      <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>move between results</dd>
+      <dt><kbd>Enter</kbd></dt><dd>open selected result</dd>
+      <dt><kbd>g</kbd> then <kbd>h</kbd></dt><dd>home</dd>
+      <dt><kbd>g</kbd> then <kbd>a</kbd></dt><dd>architecture</dd>
+      <dt><kbd>g</kbd> then <kbd>c</kbd></dt><dd>configuration</dd>
+      <dt><kbd>g</kbd> then <kbd>b</kbd></dt><dd>benchmarks</dd>
+      <dt><kbd>g</kbd> then <kbd>i</kbd></dt><dd>paper vs. code</dd>
+      <dt><kbd>g</kbd> then <kbd>t</kbd></dt><dd>troubleshooting</dd>
+      <dt><kbd>g</kbd> then <kbd>s</kbd></dt><dd>search page</dd>
+      <dt><kbd>t</kbd></dt><dd>toggle light / dark theme</dd>
+      <dt><kbd>j</kbd> <kbd>k</kbd></dt><dd>scroll down / up</dd>
+      <dt><kbd>?</kbd></dt><dd>this dialog</dd>
+    </dl>
+    <button class="overlay-close wide" id="help-close" type="button">Close</button>
+  </div>
+</div>
+<script src="assets/site.js" defer></script>
+</body>
+</html>

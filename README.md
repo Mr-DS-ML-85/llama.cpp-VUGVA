@@ -16,13 +16,15 @@ out-of-memory error.
 
 [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21549808-blue)](https://doi.org/10.5281/zenodo.21549808)
 [![llama.cpp](https://img.shields.io/badge/llama.cpp-b12119%20(3de52ac3)-green)](https://github.com/ggml-org/llama.cpp)
-[![release](https://img.shields.io/badge/release-v0.2.0-orange)](CHANGELOG.md)
+[![docs](https://img.shields.io/badge/docs-GitHub%20Pages-46d3a4)](https://mr-ds-ml-85.github.io/llama.cpp-VUGVA/)
+[![release](https://img.shields.io/badge/release-v0.2.1-orange)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-lightgrey)](LICENSE)
 
 ---
 
 ## Contents
 
+- [Documentation site](https://mr-ds-ml-85.github.io/llama.cpp-VUGVA/) — searchable, keyboard-driven
 - [Version matrix](#version-matrix)
 - [What this is (and is not)](#what-this-is-and-is-not)
 - [Quick start](#quick-start)
@@ -336,6 +338,26 @@ The paper source is included as [`VUGVA_Paper.tex`](VUGVA_Paper.tex); a
 machine-readable citation is in [`CITATION.cff`](CITATION.cff).
 
 ---
+
+## Documentation site
+
+A static, searchable version of these docs is published with GitHub Pages:
+
+**<https://mr-ds-ml-85.github.io/llama.cpp-VUGVA/>**
+
+Press `/` or `Ctrl`+`K` anywhere on it to search (full text, per section), `?` for
+the full keyboard-shortcut list (`g a` architecture, `g c` configuration,
+`g b` benchmarks, `g i` paper vs. code, `g t` troubleshooting, `t` theme).
+
+The site is generated from the Markdown in this repo — `README.md`-level docs
+stay the source of truth:
+
+```bash
+python3 tools/build_docs_site.py    # requires pandoc; writes docs/*.html + assets/search-index.json
+```
+
+`docs/index.html`, `docs/search.html` and `docs/assets/{site.css,site.js}` are
+hand-written; `docs/.nojekyll` makes Pages serve them as-is.
 
 ## Project layout
 

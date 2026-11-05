@@ -48,7 +48,8 @@ out-of-memory error.
 | **Paper** | July 2026 | **DOI: [10.5281/zenodo.21549808](https://doi.org/10.5281/zenodo.21549808)** |
 
 The upstream llama.cpp source is **vendored** in `llama.cpp/` (tracked as
-regular files, not a submodule), so a checkout of this repo is
+regular files, not a submodule, and **trimmed to build-only files** — it has
+its own `llama.cpp/README.md`), so a checkout of this repo is
 self-contained. Git tags:
 
 | Tag | Meaning |

@@ -67,9 +67,9 @@ int main(int argc, char ** argv) {
     }
 
     struct llama_model_params model_params = llama_model_default_params();
-    // Model is 16GB, VRAM is 8GB — offload only some layers to GPU
-    // VUGVA will hold the rest in DRAM
-    model_params.n_gpu_layers = 0;
+    // Request full GPU offload: VUGVA caps placement to the VRAM budget
+    // (paper Algorithm 1) and keeps the remainder in the DRAM tier.
+    model_params.n_gpu_layers = 99;
 
     struct llama_model * model = llama_model_load_from_file(model_path, model_params);
     if (!model) {
@@ -93,12 +93,22 @@ int main(int argc, char ** argv) {
 
     const struct llama_vocab * vocab = llama_model_get_vocab(model);
 
-    // Tokenize prompt
+    // Tokenize prompt — llama_tokenize with a null buffer returns the NEGATED
+    // required size, so size the vector first, then tokenize for real.
     int n_tokens = llama_tokenize(vocab, prompt, (int32_t)strlen(prompt),
                                   nullptr, 0, true, false);
+    if (n_tokens < 0) n_tokens = -n_tokens;
     std::vector<llama_token> tokens(n_tokens);
-    llama_tokenize(vocab, prompt, (int32_t)strlen(prompt),
-                   tokens.data(), n_tokens, true, false);
+    n_tokens = llama_tokenize(vocab, prompt, (int32_t)strlen(prompt),
+                              tokens.data(), (int32_t)tokens.size(), true, false);
+    if (n_tokens <= 0) {
+        fprintf(stderr, "tokenization failed (returned %d)\n", n_tokens);
+        llama_free(ctx);
+        llama_model_free(model);
+        vugva_pool_destroy(pool);
+        return 1;
+    }
+    tokens.resize(n_tokens);
     printf("  Prompt: \"%s\" (%d tokens)\n", prompt, n_tokens);
 
     // 4. Evaluate and generate

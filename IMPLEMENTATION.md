@@ -1,177 +1,127 @@
-# VUGVA Tiered Memory Implementation Plan
+# VUGVA Integration — Implementation Status
 
-## Problem Statement
+> This file previously described a plan to make VUGVA a *compute* backend in the
+> llama.cpp scheduler (`supports_op=true`, VUGVA claims every op, delegates to
+> CUDA). That approach was tried and reverted: it produced >1000 graph splits
+> and crashed in `sched_reserve`. The architecture below is what actually ships
+> and is verified to run.
 
-VUGVA backend crashes with `std::length_error: cannot create std::vector larger than max_size()` during `sched_reserve`. The scheduler creates 1028 graph splits because:
+## Architecture (current)
 
-1. VUGVA registers as ACCEL backend with `supports_op=true` → becomes primary backend (index 1, after CUDA at 0)
-2. Model weights are loaded into CUDA buffers (via `make_gpu_buft_list` in llama-model.cpp)
-3. Scheduler calls `ggml_backend_sched_backend_from_buffer()` which checks `supports_buft(backend, buffer_type) && supports_op(backend, op)`
-4. For weights in CUDA buffers: CUDA supports them (index 0), but VUGVA doesn't (`supports_buft(VUGVA, CUDA_buft)=false`)
-5. Every layer transition where a weight is on a different backend triggers `need_new_split=true` in `ggml_backend_sched_split_graph()` (line 1336)
-6. 1028 splits → vector allocation overflow → crash
-
-## Correct Architecture: VUGVA as Primary Backend with CUDA Delegation
+VUGVA is a **buffer type + memory tier manager**, never a compute backend:
 
 ```
-Model Loading:  GGUF file → VUGVA DRAM (page-locked, NUMA-bound)
-                         ↓
-Scheduler:      VUGVA claims all ops (supports_op=true)
-                Weights in VUGVA buffers → supports_buft(VUGVA, VUGVA_buft)=true
-                No graph splits! ✓
-                         ↓
-Graph Compute:  For each node:
-                  1. Promote source tensors DRAM → VRAM (cudaMemcpy H2D)
-                  2. Delegate to internal CUDA backend
-                  3. Copy outputs VRAM → DRAM (cudaMemcpy D2H)
-                  4. Free VRAM copies
+GGUF file ──mmap──► VUGVA_DRAM buffer (warm tier, pool-accounted)
+                      │
+                      ├─ hot: layers capped to free VRAM ─► CUDA0 buffer (VRAM)
+                      ├─ warm: everything else          ─► VUGVA_DRAM (page cache / pinned)
+                      └─ cold: pool budget exceeded     ─► SSD via page cache (mmap file)
+
+compute: CUDA runs the hot-tier layers; DRAM-tier weights are read directly by
+the CPU backend; llama.cpp's op_offload moves small/batched ops to CUDA.
 ```
 
-## Files to Modify
+Key properties enforced in `ggml-vugva/ggml-backend-vugva.cpp`:
 
-### 1. `src/llama-model.cpp` — Inject VUGVA buffer type into weight loading
+| Hook | Behavior | Why |
+|------|----------|-----|
+| `dev.supports_op` | `true` | consulted only by `weight_buft_supported()`/`select_buft()` for **weight placement**. VUGVA is skipped as a scheduler backend in `llama-context.cpp` and has `graph_compute = NULL`, so it never executes ops. |
+| `dev.get_buffer_type` | singleton per device | llama.cpp compares buffer-type **pointers** (`is_default_buft`); a fresh instance per call broke the mmap zero-copy import and leaked. |
+| `dev.get_host_buffer_type` | `NULL` | otherwise llama.cpp's "avoid host buffers when using mmap" rule rewrites every VUGVA selection back to the plain CPU buffer. |
+| `buft.alloc_buffer` | pool-accounted (`vugva_alloc`), `cudaMallocHost` storage, anonymous-mmap fallback | page-locked memory ⇒ scheduler H2D copies are true DMA (paper §5.1); allocation must not fail when the pool is merely over budget. |
+| `dev.buffer_from_host_ptr` | wraps the GGUF mmap range | default load mode: zero-copy weights, page cache = DRAM tier, file = cold tier. Over-budget imports are accepted with a logged warning. |
+| `buft.get_max_size` | `SIZE_MAX` | used by ggml to chunk allocations, not as a capacity gate. |
 
-**Function: `make_gpu_buft_list()` (line 1096)**
+Placement changes in `llama.cpp/src/llama-model.cpp`:
 
-Current: Only adds CUDA's buffer types to the list.
-Fix: Prepend VUGVA's buffer type so weights are loaded into VUGVA DRAM.
+1. `make_gpu_buft_list()` does **not** prepend VUGVA (an earlier revision did —
+   that sent even `-ngl` layers to DRAM and left the GPU idle). VUGVA enters as
+   the first entry of `make_cpu_buft_list()` via the generic ACCEL loop, which
+   is appended as fallback: GPU layers keep CUDA first, everything else lands in
+   VUGVA_DRAM (input layer, non-offloaded layers, KV of those layers).
+2. **Algorithm 1 / VRAM budget** in `load_tensors()`: before assigning layers,
+   free VRAM minus a reserve (`max(1 GiB, total/8)`) is compared against
+   per-layer weight sizes (`blk.N.*` from the GGUF). Requested layers that no
+   longer fit fall back to the DRAM tier instead of aborting with
+   `cudaMalloc failed: out of memory`. The output layer is budgeted first
+   (largest matmul per token). Logged as:
 
-```cpp
-static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode split_mode, const float * tensor_split) {
-    buft_list_t buft_list;
+   ```
+   load_tensors: [VUGVA] VRAM budget 5973 MiB (free 6997, reserve 1024) -> 10/41 layers + output on GPU, remainder -> VUGVA_DRAM tier (requested -ngl 99)
+   ```
 
-    // ... existing split buffer type code ...
+## Root causes fixed (the original broken state)
 
-    // add the device default buffer type
-    buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
+1. `dev.supports_op` returned `false` → every tensor rejected `VUGVA_DRAM` →
+   weights fell through to the CUDA buffer type → one contiguous
+   **19.9 GB `cudaMalloc` → OOM** on the 8 GB card (the reported 35B failure).
+2. `get_buffer_type` allocated a **new instance per call** → `is_default_buft`
+   never matched → mmap zero-copy import path was dead, plus a leak per call.
+3. `make_gpu_buft_list()` prepended VUGVA **before CUDA** → with (1) fixed,
+   all weights (including `-ngl` layers) would have gone to DRAM, GPU idle.
+4. `get_host_buffer_type()` returned VUGVA's own buft → llama.cpp's mmap rule
+   silently rewrote VUGVA selections to the CPU buffer.
+5. `vugva_alloc` failure (pool over budget) hard-failed the import → any model
+   larger than the pool could not load at all.
+6. `get_max_size()` returned the 32 GB pool size (ggml uses it to chunk).
+7. `tests/test_vugva.cpp` built a `std::vector` from the **negated** return of
+   `llama_tokenize` → `std::length_error` abort; it also forced `n_gpu_layers=0`.
+8. CMake `VUGVA_DRAM_GB` was never wired into the backend (32 GB hardcoded),
+   and the `vugva_test` target referenced by README/CI/CONTRIBUTING did not exist.
 
-    // add the device extra buffer type (if any)
-    // ... existing extra bufts code ...
+## Verified runs (RTX 4060 8 GB + 29 GB DDR5, RTX 4060 sm_89, CUDA 13.2)
 
-    // === VUGVA: Prepend VUGVA DRAM buffer type ===
-    // This makes weights load into page-locked DRAM instead of CUDA VRAM
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        ggml_backend_dev_t accel_dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(accel_dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
-            const char * name = ggml_backend_dev_name(accel_dev);
-            if (name && strstr(name, "VUGVA")) {
-                auto * vugva_buft = ggml_backend_dev_buffer_type(accel_dev);
-                if (vugva_buft) {
-                    buft_list.emplace(buft_list.begin(), accel_dev, vugva_buft);
-                }
-                break;
-            }
-        }
-    }
+| Case | Result |
+|------|--------|
+| `vugva_test` (0.8B) | `ALL TESTS PASSED`, 64 tokens, 215 tok/s |
+| 0.8B Q4_K_M, `-ngl 99` | 25/25 layers + output hot, graph splits=1, ~150–185 tok/s |
+| 0.8B Q4_K_M, `VUGVA_VRAM_MB=100`, zerocopy | 8/25 hot (99 MiB VRAM), 395 MiB warm, graph splits=1, 25–45 tok/s, output identical to full-GPU |
+| 27B Q4_K_M (17.4 GB dense), `-ngl 99` auto→zerocopy | 24/65 layers hot (6.3 GB), 9.5 GB warm, **graph splits=1**, 1.15–1.18 tok/s, coherent |
+| 27B Q4_K_M, `-ngl 99` hybrid | 14/65 hot, graph splits=70/114, 0.85–1.2 tok/s |
+| 27B Q4_K_M, `-ctk q4_0 -ctv q4_0`, ctx 4096 | KV cache 256 MiB → 72 MiB, same placement |
+| 35B MoE Q4_K_M (21.7 GB), `-ngl 99` hybrid | 12/41 hot, 19.8 GB VUGVA_DRAM, graph splits=46–60, 2.1–2.3 tok/s |
+| 35B MoE, `-ngl 99 -cmoe -ctk q4_0 -ctv q4_0`, warm cache | 41/41 attention layers hot (1.3 GB VRAM), experts mmap'd (`CPU_Mapped` 19.5 GB, no copy), graph splits=82, **27–36 tok/s** |
+| 35B MoE, same, cold page cache | ~4 tok/s (NVMe-bound first pass) |
+| 35B MoE, `VUGVA_MODE=zerocopy` forced | pin refused (>50% RAM) → zero-copy auto-disabled → pageable DRAM + hybrid, exit 0 (no OOM) |
+| 35B with `VUGVA_DRAM_GB=16` (< model size) | exit 0, cold-tier warning logged, still runs |
 
-    return buft_list;
-}
-```
+### Mode selection (llama-model.cpp, Algorithm-1 block)
 
-**Why this works:**
-- Model loader tries buffer types in order, picks first that allocates successfully
-- VUGVA's buffer type (page-locked DRAM) is tried first
-- If VUGVA fails (not enough DRAM), CUDA's buffer type is tried as fallback
-- Scheduler sees weights in VUGVA buffers → assigns ops to VUGVA → no splits
+* Hot tier is a **contiguous prefix** of the requested layers (no holes, so no
+  extra graph splits); the output layer is budgeted first and its tied
+  embedding is counted (llama.cpp duplicates `token_embd` into the output
+  buffer via `TENSOR_DUPLICATED`).
+* Tensors rewritten by `--cpu-moe` / `-ncmoe` (`tensor_buft_overrides`) are
+  excluded from the hot-tier budget, so MoE models can keep all attention/SSM
+  layers in VRAM.
+* `auto` picks `zerocopy` only when the estimated warm tier fits in RAM with a
+  25%/4 GiB margin **and** stays below 50% of physical RAM; otherwise `hybrid`.
+* Pinned allocations are capped (50% RAM, ≥2 GiB headroom, `VUGVA_PIN_MB`) and
+  a failed mapped allocation downgrades the run to `hybrid` instead of crashing.
+* CPU-buft overrides (`--cpu-moe`) now use the plain CPU buffer (mmap-backed)
+  instead of the VUGVA DRAM tier, avoiding a full copy of the expert stack.
 
-### 2. `ggml-vugva/ggml-backend-vugva.cpp` — Fix remaining bugs
+## Not implemented (paper claims without corresponding code)
 
-**Bug in `buffer_from_host_ptr` (line 695-721):**
-- Already fixed: `dev_ctx->gpu_id` now uses `(ggml_backend_vugva_device_context *)dev->context`
+Be honest about the gap between paper and code:
 
-**`graph_compute` (line 453-544):**
-- Already rewritten with per-node DRAM→VRAM staging
-- Promotes source tensors, delegates to internal CUDA, copies results back
+- **Look-Ahead Attention prefetch (Algorithm 3)** — no background DRAM→VRAM
+  weight streaming exists (`vugva`'s `prefetch.rs`/`dma.rs` are not called by
+  the ggml backend). It is unnecessary for the current placement: hot-tier
+  weights are already resident in VRAM and warm-tier weights are read directly
+  by the CPU without promotion.
+- **Runtime promotion/eviction of individual tensors** (membrane-driven tiering)
+  — placement is static for the lifetime of the run (`-ngl` + VRAM budget).
+- **GPUDirect Storage / IOMMU P2P** — the cold tier is the OS page cache over
+  the GGUF file on NVMe, not GDS.
+- The paper's measured numbers (54.8% throughput, 84.6% CPU reduction, …) are
+  not reproduced or asserted by this codebase.
 
-**`supports_op` (line 725-728):**
-- Returns `true` — VUGVA claims all ops (correct for Approach B)
+## Pool accounting
 
-**`supports_buft` (line 730-733):**
-- Returns `true` only for VUGVA's own buffer type (correct)
-
-**`offload_op` (line 735-738):**
-- Returns `true` — VUGVA offloads all ops to internal CUDA (correct)
-
-### 3. `ggml-vugva/CMakeLists.txt` — Build configuration
-
-Current state is correct:
-- Links `ggml-cuda`, `CUDA::cudart`, `CUDA::cuda_driver`, `CUDA::cublas`
-- VUGVA static lib linked from `/home/irfan/Desktop/VUGVA/vugva/target/release/libvugva.a`
-
-### 4. `CMakeLists.txt` (top-level) — NO changes needed
-
-Do NOT add `VUGVA_ENABLE` as a global compile definition. Do NOT modify ggml-cuda.cu.
-
-## How Flags Are Preserved
-
-| Flag | How it works | Impact |
-|------|-------------|--------|
-| `--n-gpu-layers` | Controls how many layers go to GPU vs CPU | Unaffected — GPU layers now use VUGVA DRAM |
-| `--n-cpu-moe` | Keeps MoE expert layers on CPU | Unaffected — CPU layers still use CPU buffers |
-| `--split-mode` | Controls tensor splitting across GPUs | Unaffected — VUGVA is single-device |
-| MTP (multi-token prediction) | Uses CUDA's MTP kernels | Unaffected — CUDA handles all compute via VUGVA delegation |
-| Flash Attention | Uses CUDA FA kernels | Unaffected — VUGVA delegates to internal CUDA |
-| Pipeline Parallelism | Uses CUDA async compute | May need VUGVA to support events — future work |
-
-## Scheduler Flow After Fix
-
-```
-1. Model loads weights into VUGVA DRAM buffers
-2. Scheduler pass 1: assigns backends based on buffer location
-   - Weights in VUGVA buffers → assigned to VUGVA (index 1)
-   - Input tensors → assigned to CPU (index 2)
-3. Scheduler pass 2-4: expand assignments
-   - All weight-adjacent ops expand to VUGVA
-4. Scheduler pass 5: create splits
-   - All VUGVA nodes → same backend → no splits ✓
-   - CPU nodes → same backend → no splits ✓
-5. graph_compute called per split
-   - VUGVA split: promote DRAM→VRAM, delegate to CUDA, copy back
-   - CPU split: compute on CPU
-```
-
-## Build Commands
-
-```bash
-cd "/run/media/irfan/models/VUGVA test/llama-cpp-VUGVA/build"
-rm -rf *
-CUDACXX=/usr/local/cuda/bin/nvcc cmake .. \
-    -DGGML_CUDA=ON \
-    -DVUGVA_ENABLE=ON \
-    -DCMAKE_BUILD_TYPE=Release
-cmake --build . -j$(nproc)
-```
-
-## Run Command
-
-```bash
-LD_LIBRARY_PATH=./bin:./lib:./ggml_build/src \
-./llama-cli -m /path/to/model.gguf -n 32 -ngl 0 "Hello"
-```
-
-## Expected Output
-
-```
-[VUGVA] Pool created: DRAM=32 GB, NUMA=yes, pinned=no
-[VUGVA] buft_alloc_buffer: allocated ggml_buf_0 (16.2 GB)
-sched_reserve: graph splits = 1 (with bs=512), 1 (with bs=1)
-... inference proceeds ...
-```
-
-## Current State
-
-- [x] ggml-cuda.cu reverted (no changes)
-- [x] CMakeLists.txt reverted (no VUGVA_ENABLE compile def)
-- [x] ggml-backend-vugva.cpp rewritten with bug fixes
-- [ ] llama-model.cpp: needs `make_gpu_buft_list` modification
-- [ ] Build and test
-
-## Key Code References
-
-- Scheduler split logic: `ggml/src/ggml-backend.cpp:1297-1425`
-- Backend selection: `ggml/src/ggml-backend.cpp:888-908`
-- Buffer type check: `ggml/src/ggml-backend.cpp:1037-1056`
-- Model weight loading: `src/llama-model.cpp:1447-1519`
-- GPU buffer type list: `src/llama-model.cpp:1096-1142`
-- VUGVA buffer type interface: `ggml-vugva/ggml-backend-vugva.cpp:345-352`
-- VUGVA graph compute: `ggml-vugva/ggml-backend-vugva.cpp:453-544`
+The Rust `TieredPool` (`/home/irfan/Desktop/VUGVA/vugva`) provides NUMA-local
+registration and bookkeeping (`vugva_alloc`/`vugva_dealloc`/`vugva_pool_info`);
+the ggml buffer owns the actual storage (mmap import or `cudaMallocHost`).
+Pool size: `cmake -DVUGVA_DRAM_GB=N`, runtime override `VUGVA_DRAM_GB=N`.
+Note: the pool attempts a whole-range `cuMemHostRegister` at creation; on a
+32 GB machine registering 32 GB fails harmlessly (bookkeeping still works).

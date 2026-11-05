@@ -50,6 +50,17 @@ GGML_API ggml_backend_buffer_type_t ggml_backend_vugva_buffer_type(int gpu_id);
 /// Must be called before any tensors are allocated. Returns 0 on success.
 GGML_API int ggml_backend_vugva_init(ggml_backend_vugva_params params);
 
+/// True when `buft` is the VUGVA_DRAM tier buffer type.
+///
+/// The CUDA backend uses this to accept warm-tier tensors in zero-copy mode
+/// (VUGVA_ZEROCOPY=1): tensors there are GPU-addressable pinned DRAM, so the
+/// CUDA kernels can read them directly over PCIe with no CPU involvement.
+GGML_API bool ggml_backend_vugva_buft_is_vugva(ggml_backend_buffer_type_t buft);
+
+/// True when this GPU can address mapped host memory via UVA (zero-copy warm
+/// tier). Returns 0 when unavailable. Safe to call before backend init.
+GGML_API int ggml_backend_vugva_zerocopy_available(void);
+
 #ifdef __cplusplus
 }
 #endif

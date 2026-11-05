@@ -21,11 +21,15 @@
 #include "ggml-impl.h"
 
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <new>
 #include <string>
+
+#include <sys/mman.h>
 
 #include <cuda_runtime.h>
 
@@ -81,10 +85,45 @@ static ggml_backend_vugva_context & vugva_ctx() {
     return ctx;
 }
 
+#ifndef VUGVA_DRAM_GB
+#define VUGVA_DRAM_GB 32
+#endif
+
+// ============================================================================
+// Zero-copy (unified DRAM+VRAM) mode
+//
+// Paper §3/§4: the DRAM tier is part of ONE virtual GPU memory space. When
+// VUGVA_ZEROCOPY=1 the DRAM buffers are allocated with cudaHostAllocMapped,
+// so the CUDA kernels read warm-tier weights directly from DRAM over PCIe —
+// the CPU never touches data-plane traffic and there is nothing to promote:
+// the GPU addresses host memory through UVA. llama-model.cpp decides the
+// mode (auto/hybrid/zerocopy) and exports it through this environment
+// variable before tensors are created.
+//
+// VUGVA_ZEROCOPY=0 (default): hybrid mode. Warm weights live in the DRAM tier
+// (pinned or mmap) and their layers are computed by the CPU backend.
+// ============================================================================
+
+static bool vugva_zerocopy_enabled(void) {
+    const char * env = getenv("VUGVA_ZEROCOPY");
+    return env && *env == '1';
+}
+
 extern "C" ggml_backend_vugva_params ggml_backend_vugva_default_params(void) {
     ggml_backend_vugva_params p = {};
     p.gpu_id = 0;
-    p.dram_pool_bytes = 32ULL * 1024 * 1024 * 1024;
+    // pool size: cmake -DVUGVA_DRAM_GB=N, overridable at runtime via VUGVA_DRAM_GB=N
+    uint64_t dram_gb = (uint64_t) VUGVA_DRAM_GB;
+    if (const char * env = getenv("VUGVA_DRAM_GB")) {
+        char * end = nullptr;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end && *end == '\0' && v > 0) {
+            dram_gb = v;
+        } else {
+            fprintf(stderr, "[VUGVA] ignoring invalid VUGVA_DRAM_GB=%s\n", env);
+        }
+    }
+    p.dram_pool_bytes = dram_gb * 1024 * 1024 * 1024;
     p.spill_enabled = 0;
     p.spill_path = nullptr;
     return p;
@@ -92,6 +131,21 @@ extern "C" ggml_backend_vugva_params ggml_backend_vugva_default_params(void) {
 
 extern "C" int ggml_backend_vugva_init(ggml_backend_vugva_params params) {
     return vugva_ctx().init(params) ? 0 : -1;
+}
+
+// Probe whether the GPU can address mapped host memory (UVA zero-copy), which
+// the warm (DRAM) tier depends on. Called before tensor placement is decided.
+extern "C" int ggml_backend_vugva_zerocopy_available(void) {
+    void * p = nullptr;
+    cudaError_t e = cudaHostAlloc(&p, 1 << 20, cudaHostAllocMapped | cudaHostAllocPortable);
+    if (e != cudaSuccess) {
+        return 0;
+    }
+    void * d = nullptr;
+    e = cudaHostGetDevicePointer(&d, p, 0);
+    const bool ok = e == cudaSuccess && d == p;
+    cudaFreeHost(p);
+    return ok ? 1 : 0;
 }
 
 // ============================================================================
@@ -104,11 +158,57 @@ static bool vugva_is_vugva_buffer(ggml_backend_buffer_t buf) {
     return strcmp(name, "VUGVA_DRAM") == 0;
 }
 
+// ── pinned-memory safety ────────────────────────────────────────────────────
+// Pinned pages (cudaHostAlloc / cudaMallocHost) cannot be reclaimed by the
+// kernel, so over-committing RAM degrades to swapping/OOM instead of a clean
+// error. Refuse to pin when the request would leave too little headroom.
+static size_t vugva_pinned_total = 0; // single-threaded at load time
+
+// Allow pinning `bytes` only if (a) we keep >= 2 GiB of free RAM headroom and
+// (b) the total pinned memory stays under half of physical RAM. Pinned pages
+// cannot be reclaimed, so exceeding this turns the desktop into swap soup.
+// VUGVA_PIN_MB overrides the cap for machines dedicated to inference.
+static bool vugva_pin_ok(size_t bytes) {
+    size_t total = 0, avail = 0;
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            size_t kb = 0;
+            if (sscanf(line, "MemTotal: %zu kB", &kb) == 1)     total = kb * 1024;
+            if (sscanf(line, "MemAvailable: %zu kB", &kb) == 1) avail = kb * 1024;
+        }
+        fclose(f);
+    }
+
+    size_t limit = total / 2;
+    if (const char * env = getenv("VUGVA_PIN_MB")) {
+        char * end = nullptr;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end && *end == '\0' && v > 0) {
+            limit = (size_t) v * 1024ull * 1024ull;
+        }
+    }
+
+    const size_t headroom = 2ull << 30;
+    if (vugva_pinned_total + bytes <= limit && bytes + vugva_pinned_total + headroom <= avail) {
+        vugva_pinned_total += bytes;
+        return true;
+    }
+    fprintf(stderr, "[VUGVA] refusing to pin %zu MiB (pinned %zu/%zu MiB, RAM available %zu MiB) — using pageable DRAM instead\n",
+            bytes / 1024 / 1024, vugva_pinned_total / 1024 / 1024, limit / 1024 / 1024,
+            avail / 1024 / 1024);
+    return false;
+}
+
 struct ggml_backend_vugva_buffer_context {
     std::string name;
     size_t      size;
     void *      dram_ptr;
     bool        owns_dram_ptr;
+    bool        is_pinned = false;    // true = page-locked (cudaMallocHost / cudaHostAllocMapped / cudaHostRegister)
+    bool        device_mapped = false; // true = GPU can address dram_ptr directly via UVA (zero-copy tier)
+    bool        is_mapped_alloc = false; // true = allocated via cudaHostAlloc (cudaFreeHost on free)
 
     ggml_backend_vugva_buffer_context(const std::string & n, size_t sz, void * ptr, bool owns = true)
         : name(n), size(sz), dram_ptr(ptr), owns_dram_ptr(owns) {}
@@ -121,7 +221,12 @@ static void ggml_backend_vugva_buffer_free(ggml_backend_buffer_t buffer) {
             vugva_dealloc(vugva_ctx().pool, ctx->name.c_str());
         }
         if (ctx->dram_ptr && ctx->owns_dram_ptr) {
-            cudaFreeHost(ctx->dram_ptr);
+            if (ctx->is_mapped_alloc || ctx->is_pinned) {
+                cudaFreeHost(ctx->dram_ptr);
+                vugva_pinned_total = vugva_pinned_total > ctx->size ? vugva_pinned_total - ctx->size : 0;
+            } else {
+                munmap(ctx->dram_ptr, ctx->size);
+            }
         }
         delete ctx;
     }
@@ -186,8 +291,14 @@ static void ggml_backend_vugva_buffer_get_tensor_2d(
 static bool ggml_backend_vugva_buffer_cpy_tensor(
     ggml_backend_buffer_t buffer,
     const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    (void)buffer;
     size_t nbytes = ggml_nbytes(src);
-    memcpy(dst->data, src->data, nbytes);
+    if (ggml_backend_buffer_is_host(src->buffer)) {
+        memcpy(dst->data, src->data, nbytes);
+    } else {
+        // device -> VUGVA DRAM: hand the transfer to the driver (D2H DMA)
+        cudaMemcpy(dst->data, src->data, nbytes, cudaMemcpyDeviceToHost);
+    }
     return true;
 }
 
@@ -243,30 +354,103 @@ static ggml_backend_buffer_t ggml_backend_vugva_buft_alloc_buffer(
     uint64_t id = counter.fetch_add(1);
     std::string name = "ggml_buf_" + std::to_string(id);
 
-    int rc = vugva_alloc(vctx.pool, name.c_str(), size);
-    if (rc != 0) return nullptr;
+    // Register with the VUGVA DRAM pool (bookkeeping + tier accounting).
+    // Going over the pool budget is NOT fatal: the excess is served by the OS
+    // as the cold tier (page cache / swap on NVMe) — paper §4 T2 semantics.
+    std::string alloc_name;
+    if (vugva_alloc(vctx.pool, name.c_str(), size) == 0) {
+        alloc_name = name;
+    } else {
+        fprintf(stderr, "[VUGVA] %zu MiB exceeds the DRAM pool budget — tracked as cold tier (SSD/page-cache)\n",
+                size / 1024 / 1024);
+    }
 
+    // Page-lock the range so scheduler copies are true CPU-bypass DMA
+    // (paper §5.1). In zero-copy mode the allocation is additionally made
+    // DEVICE-MAPPED (cudaHostAllocMapped + UVA): the GPU reads the warm tier
+    // directly over PCIe, so the CPU never touches data-plane traffic at all.
+    // Fall back to ordinary anonymous DRAM if pinning fails.
     void * dram_ptr = nullptr;
-    cudaError_t err = cudaMallocHost(&dram_ptr, size);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[VUGVA] cudaMallocHost(%zu) failed: %s\n", size, cudaGetErrorString(err));
-        vugva_dealloc(vctx.pool, name.c_str());
+    bool is_pinned = false;
+    bool device_mapped = false;
+    bool is_mapped_alloc = false;
+
+    cudaError_t err;
+    if (vugva_zerocopy_enabled() && vugva_pin_ok(size)) {
+        // mapped + portable host allocation: GPU-addressable warm tier
+        err = cudaHostAlloc(&dram_ptr, size, cudaHostAllocMapped | cudaHostAllocPortable);
+        if (err == cudaSuccess) {
+            void * dev_ptr = nullptr;
+            cudaError_t e2 = cudaHostGetDevicePointer(&dev_ptr, dram_ptr, 0);
+            // UVA: the device alias is the same address as the host pointer,
+            // which is what lets ggml tensors carry a single `data` pointer.
+            if (e2 != cudaSuccess || dev_ptr != dram_ptr) {
+                fprintf(stderr, "[VUGVA] cudaHostGetDevicePointer failed (%s) — falling back to hybrid DRAM\n",
+                        cudaGetErrorString(e2));
+                cudaFreeHost(dram_ptr);
+                dram_ptr = nullptr;
+            } else {
+                is_pinned = true;
+                device_mapped = true;
+                is_mapped_alloc = true;
+            }
+        } else {
+            fprintf(stderr, "[VUGVA] cudaHostAllocMapped(%zu MiB) failed: %s — falling back to hybrid DRAM\n",
+                    size / 1024 / 1024, cudaGetErrorString(err));
+        }
+    }
+
+    if (!dram_ptr && !device_mapped) {
+        // Zero-copy was requested but the mapped allocation failed. Disable the
+        // mode globally so the CUDA backend stops claiming VUGVA buffers (they
+        // would not be GPU-addressable) and the scheduler falls back to the CPU
+        // for the DRAM tier instead of dereferencing a bad pointer.
+        if (vugva_zerocopy_enabled()) {
+            setenv("VUGVA_ZEROCOPY", "0", 1);
+            fprintf(stderr, "[VUGVA] zero-copy allocation failed — disabling zero-copy for this run (hybrid DRAM fallback)\n");
+        }
+        err = vugva_pin_ok(size) ? cudaMallocHost(&dram_ptr, size) : cudaErrorMemoryAllocation;
+        if (err == cudaSuccess) {
+            is_pinned = true;
+            is_mapped_alloc = true;
+        } else {
+            fprintf(stderr, "[VUGVA] cudaMallocHost(%zu MiB) failed: %s — falling back to pageable DRAM\n",
+                    size / 1024 / 1024, cudaGetErrorString(err));
+            dram_ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (dram_ptr == MAP_FAILED) {
+                dram_ptr = nullptr;
+            }
+        }
+    }
+
+    if (!dram_ptr) {
+        if (!alloc_name.empty()) vugva_dealloc(vctx.pool, alloc_name.c_str());
         return nullptr;
     }
 
-    auto * ctx = new(std::nothrow) ggml_backend_vugva_buffer_context(name, size, dram_ptr);
+    auto free_storage = [&]() {
+        if (!dram_ptr) return;
+        if (is_mapped_alloc || is_pinned) cudaFreeHost(dram_ptr);
+        else munmap(dram_ptr, size);
+        dram_ptr = nullptr;
+    };
+
+    auto * ctx = new(std::nothrow) ggml_backend_vugva_buffer_context(alloc_name, size, dram_ptr);
     if (!ctx) {
-        cudaFreeHost(dram_ptr);
-        vugva_dealloc(vctx.pool, name.c_str());
+        free_storage();
+        if (!alloc_name.empty()) vugva_dealloc(vctx.pool, alloc_name.c_str());
         return nullptr;
     }
+    ctx->is_pinned = is_pinned;
+    ctx->device_mapped = device_mapped;
+    ctx->is_mapped_alloc = is_mapped_alloc;
 
     ggml_backend_buffer_t buffer = ggml_backend_buffer_init(
         buft, ggml_backend_vugva_buffer_interface, ctx, size);
     if (!buffer) {
+        free_storage();
         delete ctx;
-        cudaFreeHost(dram_ptr);
-        vugva_dealloc(vctx.pool, name.c_str());
+        if (!alloc_name.empty()) vugva_dealloc(vctx.pool, alloc_name.c_str());
         return nullptr;
     }
 
@@ -280,7 +464,9 @@ static size_t ggml_backend_vugva_buft_get_alignment(ggml_backend_buffer_type_t b
 
 static size_t ggml_backend_vugva_buft_get_max_size(ggml_backend_buffer_type_t buft) {
     (void)buft;
-    return vugva_ctx().initialized ? vugva_ctx().dram_bytes : 0;
+    // unbounded: ggml uses this only to split large allocations into chunks.
+    // Real limits are enforced by the DRAM pool + allocator fallbacks above.
+    return SIZE_MAX;
 }
 
 static size_t ggml_backend_vugva_buft_get_alloc_size(
@@ -376,12 +562,16 @@ static void ggml_backend_vugva_get_tensor_2d_async(ggml_backend_t backend,
 static bool ggml_backend_vugva_cpy_tensor_async(ggml_backend_t backend_src,
     ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
     (void)backend_src; (void)backend_dst;
-    if (!src->buffer || !dst->buffer) return false;
-    size_t nbytes = ggml_nbytes(src);
-    void * src_base = src->buffer->iface.get_base(src->buffer);
-    void * dst_base = dst->buffer->iface.get_base(dst->buffer);
-    if (!src_base || !dst_base) return false;
-    memcpy(dst_base, src_base, nbytes);
+    if (!src->buffer || !dst->buffer || !src->data || !dst->data) return false;
+    const size_t nbytes = ggml_nbytes(src);
+    if (ggml_backend_buffer_is_host(src->buffer)) {
+        memcpy(dst->data, src->data, nbytes);
+    } else {
+        // device -> VUGVA DRAM: hand the transfer to the driver (D2H DMA).
+        // VUGVA has no stream/event of its own (memory-only backend), so this
+        // runs on the default stream and is synchronized before returning.
+        cudaMemcpy(dst->data, src->data, nbytes, cudaMemcpyDeviceToHost);
+    }
     return true;
 }
 
@@ -469,18 +659,33 @@ static void ggml_backend_vugva_dev_get_props(ggml_backend_dev_t dev, ggml_backen
     props->type        = GGML_BACKEND_DEVICE_TYPE_ACCEL;
     props->device_id   = nullptr;
     ggml_backend_vugva_dev_memory(dev, &props->memory_free, &props->memory_total);
+    const bool zerocopy = vugva_zerocopy_enabled();
     props->caps = {
         /* .async                 = */ false,
         /* .host_buffer           = */ true,
-        /* .buffer_from_host_ptr  = */ true,
+        // In zero-copy mode the DRAM tier must be REAL pinned host memory
+        // (cudaHostAllocMapped) so the GPU can address it over PCIe — we
+        // cannot wrap the read-only GGUF mmap (cudaHostRegister refuses
+        // file-backed RO mappings), so the loader copies the weights into
+        // our buffers instead of importing the mapping.
+        /* .buffer_from_host_ptr  = */ !zerocopy,
         /* .events                = */ false,
         /* .mmap_support          = */ false,
     };
 }
 
+// True when `buft` is the VUGVA_DRAM tier. Used by the CUDA backend to accept
+// warm-tier tensors in zero-copy mode (see ggml-cuda.cu) and by tests.
+extern "C" bool ggml_backend_vugva_buft_is_vugva(ggml_backend_buffer_type_t buft) {
+    if (!buft || !buft->iface.get_name) return false;
+    return strcmp(buft->iface.get_name(buft), "VUGVA_DRAM") == 0;
+}
+
 // ============================================================================
 // Backend init
 // ============================================================================
+
+static ggml_backend_buffer_type_t ggml_backend_vugva_dev_get_buffer_type(ggml_backend_dev_t dev);
 
 static ggml_backend_t ggml_backend_vugva_dev_init_backend(ggml_backend_dev_t dev, const char * params) {
     (void)params;
@@ -496,21 +701,15 @@ static ggml_backend_t ggml_backend_vugva_dev_init_backend(ggml_backend_dev_t dev
 
     backend_ctx->gpu_id = dev_ctx->gpu_id;
 
-    auto * buft_ctx = new(std::nothrow) ggml_backend_vugva_buffer_type_context();
-    if (!buft_ctx) { delete backend_ctx; return nullptr; }
-    buft_ctx->gpu_id = dev_ctx->gpu_id;
-
-    auto * buft = new(std::nothrow) ggml_backend_buffer_type();
-    if (!buft) { delete buft_ctx; delete backend_ctx; return nullptr; }
-    buft->iface   = ggml_backend_vugva_buffer_type_interface;
-    buft->device  = dev;
-    buft->context = buft_ctx;
+    // reuse the singleton buffer type — pointer-stable across get_buffer_type calls
+    auto * buft = ggml_backend_vugva_dev_get_buffer_type(dev);
+    if (!buft) { delete backend_ctx; return nullptr; }
 
     backend_ctx->buft = buft;
     backend_ctx->dev  = dev;
 
     auto * backend = new(std::nothrow) ggml_backend();
-    if (!backend) { delete buft; delete buft_ctx; delete backend_ctx; return nullptr; }
+    if (!backend) { delete backend_ctx; return nullptr; }
 
     backend->iface    = ggml_backend_vugva_interface;
     backend->guid     = ggml_backend_vugva_guid();
@@ -525,6 +724,13 @@ static ggml_backend_t ggml_backend_vugva_dev_init_backend(ggml_backend_dev_t dev
 // ============================================================================
 
 static ggml_backend_buffer_type_t ggml_backend_vugva_dev_get_buffer_type(ggml_backend_dev_t dev) {
+    // A single stable instance per device: llama.cpp compares buffer type
+    // POINTERS (is_default_buft, ctx_map keys). Returning a fresh object per
+    // call broke the mmap zero-copy fast path and leaked an instance each call.
+    static ggml_backend_buffer_type_t cached = nullptr;
+    if (cached && cached->device == dev) {
+        return cached;
+    }
     auto * ctx = (ggml_backend_vugva_device_context *)dev->context;
     auto * buft_ctx = new ggml_backend_vugva_buffer_type_context();
     buft_ctx->gpu_id = ctx->gpu_id;
@@ -532,11 +738,16 @@ static ggml_backend_buffer_type_t ggml_backend_vugva_dev_get_buffer_type(ggml_ba
     buft->iface   = ggml_backend_vugva_buffer_type_interface;
     buft->device  = dev;
     buft->context = buft_ctx;
+    cached = buft;
     return buft;
 }
 
+// VUGVA_DRAM *is* host memory — there is no separate staging buffer type.
+// Returning NULL keeps llama.cpp's "avoid using a host buffer when using
+// mmap" rule from rewriting VUGVA selections back to the plain CPU buffer.
 static ggml_backend_buffer_type_t ggml_backend_vugva_dev_get_host_buffer_type(ggml_backend_dev_t dev) {
-    return ggml_backend_vugva_dev_get_buffer_type(dev);
+    (void)dev;
+    return nullptr;
 }
 
 static ggml_backend_buffer_t ggml_backend_vugva_dev_buffer_from_host_ptr(
@@ -549,23 +760,36 @@ static ggml_backend_buffer_t ggml_backend_vugva_dev_buffer_from_host_ptr(
     uint64_t id = counter.fetch_add(1);
     std::string name = "import_buf_" + std::to_string(id);
 
-    int rc = vugva_alloc(vctx.pool, name.c_str(), size);
-    if (rc != 0) return nullptr;
+    // Register with the DRAM pool when it has room; imports larger than the
+    // pool budget (e.g. 70B Q4 on a 32 GB pool) still load — the file mapping
+    // itself is backed by page cache / NVMe, i.e. the paper's cold tier.
+    std::string alloc_name;
+    if (vugva_alloc(vctx.pool, name.c_str(), size) == 0) {
+        alloc_name = name;
+    } else {
+        fprintf(stderr, "[VUGVA] import of %zu MiB exceeds the DRAM pool budget — tracked as cold tier (SSD/page-cache)\n",
+                size / 1024 / 1024);
+    }
 
-    auto * ctx = new(std::nothrow) ggml_backend_vugva_buffer_context(name, size, ptr, false);
-    if (!ctx) { vugva_dealloc(vctx.pool, name.c_str()); return nullptr; }
+    auto * ctx = new(std::nothrow) ggml_backend_vugva_buffer_context(alloc_name, size, ptr, false);
+    if (!ctx) { if (!alloc_name.empty()) vugva_dealloc(vctx.pool, alloc_name.c_str()); return nullptr; }
 
     auto * buft = ggml_backend_vugva_dev_get_buffer_type(dev);
     ggml_backend_buffer_t buffer = ggml_backend_buffer_init(
         buft, ggml_backend_vugva_buffer_interface, ctx, size);
-    if (!buffer) { delete ctx; vugva_dealloc(vctx.pool, name.c_str()); return nullptr; }
+    if (!buffer) { delete ctx; if (!alloc_name.empty()) vugva_dealloc(vctx.pool, alloc_name.c_str()); return nullptr; }
     return buffer;
 }
 
-// supports_op=false: VUGVA is buffer-only, scheduler routes ops to CUDA/CPU
+// VUGVA never computes (graph_compute == NULL) and is deliberately NOT a
+// scheduler backend (llama-context.cpp skips ACCEL "VUGVA"), so this callback
+// is only consulted when llama.cpp SELECTS BUFFER TYPES FOR WEIGHTS
+// (weight_buft_supported / select_buft / llama_model::select_buft for KV).
+// Returning false there made every tensor reject VUGVA_DRAM — the root cause
+// of weights falling back to CUDA (single huge cudaMalloc -> OOM) or CPU.
 static bool ggml_backend_vugva_dev_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     (void)dev; (void)op;
-    return false;
+    return true;
 }
 
 static bool ggml_backend_vugva_dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {

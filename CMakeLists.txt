@@ -35,6 +35,8 @@ add_subdirectory(${LLAMA_DIR}      ${CMAKE_BINARY_DIR}/llama_build)
 # ── VUGVA Backend (ggml → VUGVA → CUDA) ─────────────────────────────────
 if(VUGVA_ENABLE)
     add_subdirectory(ggml-vugva)
+    # wire the DRAM pool size option into the backend (runtime override: env VUGVA_DRAM_GB)
+    target_compile_definitions(ggml-vugva PRIVATE VUGVA_DRAM_GB=${VUGVA_DRAM_GB})
     # GGML_USE_VUGVA is PUBLIC on ggml — propagates to llama and all consumers
     target_compile_definitions(ggml PUBLIC GGML_USE_VUGVA=1)
     target_include_directories(ggml PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/ggml-vugva)
@@ -54,6 +56,22 @@ if(GGML_CUDA)
 endif()
 if(VUGVA_ENABLE)
     target_link_libraries(llama-cli PRIVATE ggml-vugva)
+endif()
+
+# ── vugva_test (integration test — README / CI entry point) ─────────────
+add_executable(vugva_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_vugva.cpp)
+target_link_libraries(vugva_test PRIVATE llama ggml ggml-base ggml-cpu pthread dl m)
+target_include_directories(vugva_test PRIVATE
+    ${LLAMA_DIR}/include
+    ${LLAMA_DIR}/ggml/include
+)
+target_compile_definitions(vugva_test PRIVATE VUGVA_DRAM_GB=${VUGVA_DRAM_GB})
+if(GGML_CUDA)
+    target_link_libraries(vugva_test PRIVATE ggml-cuda CUDA::cudart CUDA::cuda_driver CUDA::cublas)
+endif()
+if(VUGVA_ENABLE)
+    target_compile_definitions(vugva_test PRIVATE GGML_USE_VUGVA=1)
+    target_link_libraries(vugva_test PRIVATE ggml-vugva)
 endif()
 
 # ── llama-bench ──────────────────────────────────────────────────────────

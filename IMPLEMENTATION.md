@@ -1,5 +1,10 @@
 # VUGVA Integration — Implementation Status
 
+> Version: integration **0.2.0** · vendored llama.cpp **b12119** (`3de52ac3`,
+> 2026-11-04) · VUGVA core `898e5e1` · paper DOI 10.5281/zenodo.21549808.
+> See `README.md` (version matrix) and `docs/` for user-facing docs and
+> `CHANGELOG.md` for the history.
+
 > This file previously described a plan to make VUGVA a *compute* backend in the
 > llama.cpp scheduler (`supports_op=true`, VUGVA claims every op, delegates to
 > CUDA). That approach was tried and reverted: it produced >1000 graph splits

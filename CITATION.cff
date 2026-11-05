@@ -1,0 +1,50 @@
+cff-version: 1.2.0
+title: "llama-cpp-VUGVA: VUGVA tiered-memory backend for llama.cpp"
+message: "If you use this integration, please cite the VUGVA paper (DOI below)."
+type: software
+version: "0.2.0"
+date-released: "2026-11-05"
+authors:
+  - name: "Irfan Mahir"
+    email: "irfan@furylogic.com"
+    affiliation: "Independent Researcher, Bangladesh"
+repository-code: "https://github.com/Mr-DS-ML-85/llama.cpp-VUGVA"
+url: "https://github.com/Mr-DS-ML-85/VUGVA"
+doi: "10.5281/zenodo.21549808"
+license: "AGPL-3.0"
+keywords:
+  - llama.cpp
+  - ggml
+  - vram
+  - tiered-memory
+  - memory-virtualization
+  - cuda
+  - cpu-bypass
+  - dma
+  - llm
+  - inference
+  - moe
+references:
+  - type: software
+    title: "VUGVA: Virtual Unified GPU VRAM Architecture (core implementation)"
+    authors:
+      - name: "Irfan Mahir"
+    repository-code: "https://github.com/Mr-DS-ML-85/VUGVA"
+    version: "898e5e1"
+  - type: software
+    title: "llama.cpp"
+    authors:
+      - name: "ggml-org and contributors"
+    repository-code: "https://github.com/ggml-org/llama.cpp"
+    version: "b12119 (3de52ac3)"
+preferred-citation:
+  type: article
+  title: "VUGVA: A Software-Defined Virtual Unified GPU VRAM Architecture with CPU-Bypass Hybrid Memory for Non-NVLink Multi-GPU Clusters"
+  authors:
+    - name: "Irfan Mahir"
+      email: "irfan@furylogic.com"
+      affiliation: "Independent Researcher, Bangladesh"
+  year: 2026
+  month: 7
+  doi: "10.5281/zenodo.21549808"
+  url: "https://doi.org/10.5281/zenodo.21549808"

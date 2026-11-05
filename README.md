@@ -1,190 +1,335 @@
 # llama-cpp-VUGVA
 
-**llama.cpp with VUGVA tiered memory** — run models larger than VRAM by tiering between DRAM and GPU.
+**Run LLMs larger than your VRAM.** VUGVA is a software-defined tiered-memory
+layer for `llama.cpp`: model weights are automatically split across
+**VRAM (hot) → DRAM (warm) → SSD (cold)** instead of failing with a CUDA
+out-of-memory error.
 
 ```
-╔══════════════════════════════════════════════════════════════╗
-║  VRAM (hot)  ←→  DRAM (warm)  ←→  SSD (cold)               ║
-║  8 GB GPU       32 GB RAM         unlimited NVMe             ║
-╚══════════════════════════════════════════════════════════════╝
+            hot                 warm                 cold
+     ┌──────────────┐   ┌──────────────────┐   ┌────────────────┐
+     │   VRAM 8 GB  │ ← │    DRAM 32 GB    │ ← │  NVMe (page    │
+     │              │   │  (pinned / UVA)  │   │  cache / SSD)  │
+     └──────────────┘   └──────────────────┘   └────────────────┘
+        CUDA compute       GPU-readable          mmap zero-copy
 ```
 
-VUGVA ([paper](https://doi.org/10.5281/zenodo.21549808)) virtualizes GPU memory by splitting tensors across DRAM and VRAM. Hot tensors stay on GPU; cold tensors live in RAM and are promoted via CPU-bypass DMA when accessed.
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21549808-blue)](https://doi.org/10.5281/zenodo.21549808)
+[![llama.cpp](https://img.shields.io/badge/llama.cpp-b12119%20(3de52ac3)-green)](https://github.com/ggml-org/llama.cpp)
+[![release](https://img.shields.io/badge/release-v0.2.0-orange)](CHANGELOG.md)
+[![license](https://img.shields.io/badge/license-AGPL--3.0-lightgrey)](LICENSE)
 
-## What this does
+---
 
-| Feature | Description |
-|---------|-------------|
-| **Tiered memory** | 32 GB DRAM + 8 GB VRAM = 40 GB unified pool |
-| **CPU-bypass DMA** | CPU touches only 72 bytes per promotion (paper §5.1) |
-| **Hot/cold placement** | Membrane-driven tiering with decayed access rates |
-| **Predictive prefetch** | Look-ahead attention tracking (paper §3.2) |
-| **SSD cold tier** | Spill to NVMe for models > DRAM (optional) |
+## Contents
+
+- [Version matrix](#version-matrix)
+- [What this is (and is not)](#what-this-is-and-is-not)
+- [Quick start](#quick-start)
+- [How tiering works](#how-tiering-works)
+- [The MoE fast path](#the-moe-fast-path)
+- [CLI flags](#cli-flags)
+- [Configuration](#configuration)
+- [Measured results](#measured-results)
+- [Pinning safety](#pinning-safety)
+- [Troubleshooting](#troubleshooting)
+- [Citation](#citation)
+- [License](#license)
+
+---
+
+## Version matrix
+
+| Component | Version | Exact reference |
+|---|---|---|
+| **This integration (VUGVA backend for llama.cpp)** | **v0.2.0** | tag `v0.2.0` |
+| **llama.cpp upstream** | **b12119** | commit [`3de52ac3`](https://github.com/ggml-org/llama.cpp/commit/3de52ac38818978d6da8f386eda43a856e53714a) · 2026-11-04 |
+| **VUGVA core (Rust)** | `898e5e1` | [Mr-DS-ML-85/VUGVA](https://github.com/Mr-DS-ML-85/VUGVA) · `898e5e1bfd0259f2a49c39345fe307c85bc3c22c` |
+| **Paper** | July 2026 | **DOI: [10.5281/zenodo.21549808](https://doi.org/10.5281/zenodo.21549808)** |
+
+The upstream llama.cpp source is **vendored** in `llama.cpp/` (tracked as
+regular files, not a submodule), so a checkout of this repo is
+self-contained. Git tags:
+
+| Tag | Meaning |
+|---|---|
+| `v0.2.0` | this release |
+| `llama.cpp-b12119-3de52ac3` | exact vendored upstream snapshot |
+
+---
+
+## What this is (and is not)
+
+**It is** a ggml *buffer type* plus a placement policy:
+
+* `VUGVA_DRAM` — a real backend buffer type whose memory comes from the VUGVA
+  DRAM pool (NUMA-aware, page-locked when safe, optionally GPU-mapped).
+* **Algorithm 1 placement** — `-ngl` requests GPU layers; the hot tier is
+  filled with a contiguous prefix that actually fits, and the remainder is
+  served from the warm tier instead of failing.
+* Two execution modes for warm-tier weights: **zero-copy** (CUDA reads pinned
+  DRAM over PCIe via UVA) and **hybrid** (the CPU backend computes warm layers).
+* A **MoE fast path**: when a sparse-expert model does not fit VRAM, expert
+  tensors stay in mmap'd CPU memory while attention/SSM stays hot on the GPU.
+
+**It is not** a compute backend. CUDA is always the compute engine; VUGVA never
+runs graphs. This is deliberate: routing every layer through a separate
+scheduler backend produced >1000 graph splits and a `sched_reserve` crash in an
+earlier iteration (see `IMPLEMENTATION.md`).
+
+---
 
 ## Quick start
 
 ```bash
-# 1. Build VUGVA
-cd /home/irfan/Desktop/VUGVA/vugva
-cargo build --release
+# 1. Build the VUGVA core (Rust)
+git clone https://github.com/Mr-DS-ML-85/VUGVA.git
+cd VUGVA/vugva && cargo build --release        # -> target/release/libvugva.so
 
-# 2. Build llama-cpp-VUGVA
+# 2. Build llama.cpp + VUGVA
 cd /path/to/llama-cpp-VUGVA
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON \
+      -DVUGVA_DIR=/path/to/VUGVA/vugva
 cmake --build build -j
 
-# 3. Run
+# 3. Smoke test (integration test binary)
 ./build/vugva_test model.gguf "Once upon a time"
+
+# 4. Generate text
+./build/llama-cli -m model.gguf -ngl 99 "Write a short story" -n 64
 ```
 
-## Running models larger than VRAM
+Requirements: Linux, CUDA 11+, an NVIDIA GPU, and system RAM for the warm tier.
 
-Weight placement follows Algorithm 1 of the paper: `-ngl` requests GPU layers,
-VUGVA measures free VRAM and caps the **hot tier** to a **contiguous** block
-that actually fits — the remainder stays in the **DRAM tier** instead of
-failing with a CUDA OOM. Models larger than the DRAM pool spill to the **cold
-tier** (NVMe via page cache) automatically.
+---
 
-Two DRAM-tier execution modes are supported (selected automatically):
+## How tiering works
 
-| mode | warm-tier weights | warm-tier compute | when |
+Weight placement happens at load time, before any tensor is allocated:
+
+1. **Budget** — free VRAM minus a reserve (`max(total/8, 1 GiB)`,
+   `VUGVA_RESERVE_MB`) is the hot-tier budget; `VUGVA_VRAM_MB` can force it.
+2. **Hot block** — layers are assigned as a **contiguous prefix** (no holes:
+   holes would add graph splits on every token). The output layer is budgeted
+   first, including the duplicated embedding of tied models.
+3. **Warm tier** — everything else goes to `VUGVA_DRAM`.
+4. **Cold tier** — beyond the DRAM pool, VUGVA falls back to pageable memory,
+   so the OS spills to NVMe and pages weights back on demand.
+
+### Execution modes
+
+| Mode | Warm-tier storage | Warm-tier compute | When selected by `auto` |
 |---|---|---|---|
-| `zerocopy` | mapped pinned host memory (`cudaHostAllocMapped`) | **CUDA** reads over PCIe (UVA) | warm tier fits in RAM and the GPU supports UVA |
-| `hybrid` | pageable/pinned DRAM | **CPU** backend | warm tier does not fit in RAM |
+| `zerocopy` | `cudaHostAllocMapped` pinned DRAM (UVA) | **CUDA** reads over PCIe | warm tier fits in RAM with margin and stays under the pin cap |
+| `hybrid` | pinned or pageable DRAM | **CPU** backend | otherwise |
 
-In `zerocopy` mode the CPU never touches data-plane traffic: the GPU kernels
-dereference the warm-tier pointers directly, so the scheduler sees a single
-graph split instead of one H2D copy per DRAM-resident layer.
+In `zerocopy` mode the scheduler sees the warm tier as GPU-addressable, so
+there is **one graph split** for the whole model instead of one H2D copy per
+warm layer. The CPU never touches weight data.
 
-```bash
-# 0.8B — everything fits in VRAM
-./build/llama-cli -m Qwen3.5-0.8B.Q4_K_M.gguf -ngl 99 "The capital of France is" -n 32
-
-# 27B Q4_K_M (17.4 GB) on 8 GB VRAM — 24/65 layers hot, rest zero-copy DRAM
-./build/llama-cli -m Qwen3.8-27B-Fable-Distill-Q4_K_M.gguf -ngl 99 "Write a story" -n 32
-
-# 35B MoE Q4_K_M (21.7 GB) — keep sparse experts in CPU/mmap, attention hot:
-#   -cmoe        experts stay in the (mmap'd) CPU buffer list, no 20 GB copy
-#   -ctk q4_0 -ctv q4_0   int4 KV cache (needs flash attention, auto-enabled)
-./build/llama-cli -m Ornith-1.5-35B-Q4_K_M.gguf -ngl 99 -cmoe \
-    -ctk q4_0 -ctv q4_0 --temp 0.7 --repeat-penalty 1.1 "Explain why the sky is blue" -n 64
-
-# DRAM pool size: cmake -DVUGVA_DRAM_GB=N, or override at runtime
-VUGVA_DRAM_GB=16 ./build/llama-cli -m model.gguf -ngl 99 "Hello"
+```
+hybrid  :  layer0..k (CUDA)  ⇄  CPU copies  ⇄  layer k+1..N (CPU)
+zerocopy:  layer0..N (all CUDA)  ── reads ──▶  warm tier in DRAM (UVA)
 ```
 
-Placement and mode are visible in the load log:
+Force a mode with `VUGVA_MODE=hybrid|zerocopy` (default `auto`).
+
+---
+
+## The MoE fast path
+
+Sparse Mixture-of-Experts models (Qwen-MoE, DeepSeek, Mixtral, …) do not fit in
+consumer VRAM, but only a handful of experts are active per token. Copying the
+whole expert stack into the DRAM tier wastes RAM and does not help: those
+weights are read once per token anyway.
+
+**Since v0.2.0 this is automatic.** If `n_expert > 0` and the model does not
+fit the VRAM budget (and no explicit tensor overrides were given):
+
+* sparse expert tensors (`blk.N.ffn_{up,down,gate,gate_up}_exps`) are routed to
+  **plain CPU memory (mmap-backed, zero copy)**,
+* attention / SSM / shared experts stay **hot in VRAM**,
+* the hot-tier budget only counts the dense part of each layer.
+
+No flags required. Disable with `VUGVA_AUTO_MOE=0`. The manual equivalents are
+still available: `-cmoe` / `--cpu-moe` (all experts) and `-ncmoe N`
+(first N layers).
+
+Example load log on a 35B MoE with 8 GB VRAM:
 
 ```text
-load_tensors: [VUGVA] auto mode: model 20697 MiB, warm-tier estimate 17296 MiB, RAM available 23853 MiB (cap 15334 MiB) -> hybrid
-load_tensors: [VUGVA] mode=hybrid VRAM budget 6337 MiB (free 7361, reserve 1024) -> 41/41 layers + output on GPU, remainder -> VUGVA_DRAM tier (requested -ngl 99)
-load_tensors:   CPU_Mapped model buffer size = 19486.84 MiB   # --cpu-moe experts (mmap, zero copy)
-load_tensors:        CUDA0 model buffer size =  1302.90 MiB   # hot tier (attention/SSM)
+load_tensors: [VUGVA] MoE model does not fit VRAM (20424 MiB > 6284 MiB) ->
+              auto-routing expert tensors to CPU/mmap (VUGVA_AUTO_MOE=0 to disable)
+load_tensors: [VUGVA] MoE fast path: sparse experts -> CPU/mmap, attention/SSM stays hot in VRAM
+load_tensors:        CUDA0 model buffer size =  1302.90 MiB   # attention/SSM hot
+load_tensors:   CPU_Mapped model buffer size = 19486.84 MiB   # experts, mmap zero-copy
 ```
 
-### Tuning knobs
+---
 
-| variable | meaning |
+## CLI flags
+
+The bundled `llama-cli` is a compact CLI built on `libllama`:
+
+| Flag | Description |
 |---|---|
-| `VUGVA_MODE=auto\|hybrid\|zerocopy` | tier execution mode (default `auto`) |
-| `VUGVA_VRAM_MB=N` | force the hot-tier (VRAM) budget; useful to exercise the DRAM tier on small models |
-| `VUGVA_RESERVE_MB=N` | VRAM to keep free for KV cache/activations (default: `max(total/8, 1 GiB)`) |
-| `VUGVA_PIN_MB=N` | max pinned host memory for the warm tier (default: 50% of RAM) |
-| `VUGVA_DRAM_GB=N` | DRAM pool size override |
+| `-m, --model FILE` | GGUF model |
+| `-n, --n-predict N` | tokens to generate (default 32) |
+| `-ngl N` | layers to offload (default 99) |
+| `-c N` | context size (default prompt + n) |
+| `-b N` | batch size |
+| `-t N` | threads |
+| `-fa on\|off\|auto` | flash attention (auto-enabled for quantized KV) |
+| `-ctk TYPE` / `-ctv TYPE` | KV cache types: `f16`, `bf16`, `q8_0`, `q4_0`, … |
+| `-cmoe, --cpu-moe` | keep all MoE expert weights in CPU/DRAM |
+| `-ncmoe N, --n-cpu-moe N` | first N layers' experts in CPU/DRAM |
+| `--temp`, `--top-k`, `--top-p`, `--min-p`, `-rp`, `--seed` | sampling |
+| `-p PROMPT` | prompt (or pass it positionally) |
+| `-h, --help` | usage |
 
-### Measured on this machine (RTX 4060 8 GB + 29 GB DDR5, NVMe)
-
-| model | configuration | decode |
-|---|---|---|
-| Qwen3.5 0.8B Q4_K_M | `-ngl 99` (25/25 hot) | ~150–185 t/s |
-| Qwen3 27B dense Q4_K_M | `-ngl 99`, auto → zerocopy (24/65 hot) | ~1.2 t/s |
-| Ornith 35B MoE Q4_K_M | `-ngl 99` (hybrid, 12/41 hot) | ~2.1–2.3 t/s |
-| Ornith 35B MoE Q4_K_M | `-ngl 99 -cmoe -ctk q4_0 -ctv q4_0`, warm page cache | **~27–36 t/s** |
-| Ornith 35B MoE Q4_K_M | same, cold page cache (first run) | ~4 t/s (NVMe-bound) |
-
-For sparse MoE models the winning configuration is attention/SSM hot in VRAM
-plus sparse experts left in the mmap'd CPU buffer: only the ~8/256 active
-experts are touched per token, so the working set fits in page cache and no
-20 GB copy into the DRAM tier is needed.
-
-### Pinning safety
-
-Pinned (`cudaHostAlloc` / `cudaMallocHost`) pages cannot be reclaimed by the
-kernel, so over-committing turns the machine into swap soup. VUGVA therefore:
-
-* refuses to pin beyond **50% of physical RAM** and always keeps ≥ 2 GiB free
-  (`VUGVA_PIN_MB` overrides the cap on dedicated inference boxes),
-* falls back to pageable DRAM when a mapped allocation fails and **disables
-  zero-copy for the rest of the run**, so the scheduler degrades to `hybrid`
-  instead of dereferencing non-GPU-addressable memory.
-
-## Architecture
-
-```
-llama-cpp-VUGVA/
-├── ggml-vugva/              # VUGVA ggml backend
-│   ├── ggml-backend-vugva.h # Public API
-│   └── ggml-backend-vugva.cpp
-├── llama.cpp/               # Upstream llama.cpp (submodule)
-├── CMakeLists.txt
-└── README.md
-```
-
-## How it works
-
-1. **Placement**: `-ngl` layers are packed into VRAM as a contiguous hot block
-   (`VUGVA_VRAM_MB` / free-VRAM budget); the rest go to the VUGVA DRAM tier
-2. **Warm tier**: VUGVA_DRAM buffers are allocated from the DRAM pool
-   (NUMA-aware, page-locked when it fits)
-3. **Zero-copy mode**: the warm tier is `cudaHostAllocMapped` pinned memory, so
-   ggml-cuda kernels read it directly over PCIe through UVA — the scheduler
-   treats the warm tier as GPU-addressable and emits no H2D copies
-4. **Hybrid mode**: the warm tier is computed by the CPU backend and only
-   activations cross PCIe
-5. **Compute**: CUDA is always the compute engine; VUGVA only manages memory
-   placement and the DRAM pool
-
-```
-DRAM pool (32 GB)                    VRAM (8 GB)
-┌──────────────────┐               ┌──────────────┐
-│ tensor_0 (cold)  │   promote     │ tensor_A     │
-│ tensor_1 (cold)  │ ───────────→  │ tensor_B     │
-│ tensor_2 (warm)  │ ←───────────  │ tensor_C     │
-│ ...              │   evict       │              │
-└──────────────────┘               └──────────────┘
-```
-
-## Requirements
-
-- CUDA 11.0+ (tested with 13.1)
-- NVIDIA GPU with compute capability 6.0+ (tested on RTX 4060, sm_89)
-- 32+ GB system RAM
-- Linux (NUMA-aware allocation)
-
-## Integration with upstream
-
-This repo tracks llama.cpp as a submodule. To update:
+Examples:
 
 ```bash
-cd llama.cpp
-git pull origin master
-cd ..
-git add llama.cpp
-git commit -m "chore: update llama.cpp"
+# all weights hot
+./build/llama-cli -m qwen0.8b.gguf -ngl 99 "The capital of France is" -n 32
+
+# dense model larger than VRAM: automatic tiering + zero-copy
+./build/llama-cli -m qwen27b.gguf -ngl 99 "Write a story" -n 32
+
+# MoE: automatic fast path, int4 KV cache, sampling
+./build/llama-cli -m ornith35b.gguf -ngl 99 -ctk q4_0 -ctv q4_0 \
+    --temp 0.7 --repeat-penalty 1.1 "Explain why the sky is blue" -n 64
 ```
 
-## License
+---
 
-AGPL-3.0 (same as llama.cpp + VUGVA)
+## Configuration
+
+All knobs are environment variables checked at load time.
+
+| Variable | Default | Description |
+|---|---|---|
+| `VUGVA_MODE` | `auto` | `auto` \| `hybrid` \| `zerocopy` |
+| `VUGVA_VRAM_MB` | auto | force the hot-tier budget (MiB); useful for testing spill |
+| `VUGVA_RESERVE_MB` | `max(total/8, 1 GiB)` | VRAM kept free for KV cache/activations |
+| `VUGVA_PIN_MB` | 50 % of RAM | cap on pinned warm-tier memory |
+| `VUGVA_DRAM_GB` | 32 | DRAM pool size (runtime override of the CMake value) |
+| `VUGVA_AUTO_MOE` | `1` | auto-route experts to CPU/mmap when the model exceeds VRAM |
+| `VUGVA_ZEROCOPY` | set by mode | internal; makes the CUDA backend accept `VUGVA_DRAM` |
+| `GGML_OP_OFFLOAD_MIN_BATCH` | 32 | min batch for op offload (llama.cpp) |
+| `GGML_SCHED_DEBUG` | off | scheduler debug output |
+
+CMake options: `-DVUGVA_ENABLE=ON|OFF`, `-DVUGVA_DRAM_GB=N`,
+`-DVUGVA_DIR=/path/to/VUGVA/vugva`, `-DGGML_CUDA=ON`.
+
+---
+
+## Measured results
+
+RTX 4060 (8 GB, sm_89), 29 GB DDR5, NVMe; CUDA 13.2; llama.cpp b12119.
+
+| Model | Configuration | Decode |
+|---|---|---|
+| Qwen3.5 0.8B Q4_K_M | `-ngl 99` (25/25 hot) | **~150–188 t/s** |
+| Qwen3 27B dense Q4_K_M (17.4 GB) | `-ngl 99`, auto → zerocopy (23–24/65 hot) | **~1.15 t/s** |
+| Qwen3 27B dense, hybrid | `-ngl 99`, `VUGVA_MODE=hybrid` | ~0.85–1.2 t/s |
+| Ornith 35B MoE Q4_K_M (21.7 GB) | `-ngl 99` before the MoE fast path | ~2.1–2.3 t/s |
+| Ornith 35B MoE | `-ngl 99`, auto MoE, warm page cache | **~20–36 t/s** |
+| Ornith 35B MoE | same, cold page cache (first pass) | ~4 t/s (NVMe-bound) |
+
+KV-cache quantization: 27B, 4 K context → KV buffer **256 MiB (f16) → 72 MiB
+(q4_0)**, same placement.
+
+Memory behaviour: zero-copy warm tier on the 27B → **graph splits = 1** (vs 70
+in hybrid). 0.8B forced tier (`VUGVA_VRAM_MB=100`) → 8/25 layers hot, CUDA0
+buffer exactly 99.4 MiB, output identical to the full-GPU run.
+
+Reproduction details and methodology are in [docs/benchmarks.md](docs/benchmarks.md).
+
+---
+
+## Pinning safety
+
+Pinned host pages (`cudaHostAlloc`, `cudaMallocHost`) cannot be reclaimed by
+the kernel. Over-committing RAM therefore does not degrade gracefully — the
+machine starts swapping and can be OOM-killed (this happened during
+development when a 20 GB warm tier was pinned on a 29 GB box).
+
+VUGVA therefore:
+
+* caps pinned memory at **50 % of physical RAM** and keeps **≥ 2 GiB**
+  headroom (`VUGVA_PIN_MB` overrides the cap for dedicated boxes),
+* refuses the pin and uses **pageable DRAM** when the limit would be exceeded,
+* if a mapped allocation fails, **disables zero-copy for the run** and falls
+  back to `hybrid`, so the scheduler never dereferences non-GPU memory.
+
+A refused pin is not an error: the run continues in hybrid mode.
+
+---
+
+## Troubleshooting
+
+See [docs/troubleshooting.md](docs/troubleshooting.md). Common cases:
+
+* **`refusing to pin …`** — expected on large models; the run degrades to
+  pageable/hybrid. Raise `VUGVA_PIN_MB` only on a dedicated inference machine.
+* **Slow first run, fast afterwards** — the mmap'd weights are being faulted in
+  from NVMe. The page cache holds them on subsequent runs.
+* **Quantized KV fails to load** — the KV types must be compiled into the CUDA
+  FlashAttention kernels (`GGML_CUDA_FA_QUANTS`, e.g. `q4_0-q4_0`).
+* **`ggml_backend_sched` splits > 100** — the model is in hybrid mode; the CPU
+  is computing warm layers. Compare with `VUGVA_MODE=zerocopy`.
+
+---
 
 ## Citation
 
+If you use VUGVA or this integration, please cite the paper:
+
 ```bibtex
-@software{vugva2026,
-  title   = {VUGVA: Virtual Unified GPU VRAM Architecture},
-  author  = {Irfan Mahir},
-  year    = {2026},
-  doi     = {10.5281/zenodo.21549808},
-  url     = {https://github.com/Mr-DS-ML-85/VUGVA}
+@article{ mahir2026vugva,
+  author       = {Mahir, Irfan},
+  title        = {VUGVA: A Software-Defined Virtual Unified GPU VRAM Architecture
+                  with CPU-Bypass Hybrid Memory for Non-NVLink Multi-GPU Clusters},
+  year         = {2026},
+  month        = {July},
+  doi          = {10.5281/zenodo.21549808},
+  url          = {https://doi.org/10.5281/zenodo.21549808},
+  note         = {Reference implementation: https://github.com/Mr-DS-ML-85/VUGVA}
 }
 ```
+
+Plain text:
+
+> Irfan Mahir. *VUGVA: A Software-Defined Virtual Unified GPU VRAM Architecture
+> with CPU-Bypass Hybrid Memory for Non-NVLink Multi-GPU Clusters.* July 2026.
+> DOI: 10.5281/zenodo.21549808.
+> https://github.com/Mr-DS-ML-85/VUGVA
+
+The paper source is included as [`VUGVA_Paper.tex`](VUGVA_Paper.tex); a
+machine-readable citation is in [`CITATION.cff`](CITATION.cff).
+
+---
+
+## Project layout
+
+```
+llama-cpp-VUGVA/
+├── ggml-vugva/          # VUGVA ggml buffer type + DRAM pool bridge
+├── llama.cpp/           # vendored llama.cpp b12119 + VUGVA patches
+├── tests/test_vugva.cpp # integration test (build target: vugva_test)
+├── docs/                # architecture, configuration, benchmarks, troubleshooting
+├── VUGVA_Paper.tex      # paper source
+├── CHANGELOG.md
+└── CMakeLists.txt
+```
+
+How the vendored tree is maintained: `llama.cpp/` is a plain directory in this
+repo (no submodule). The upstream git history used for rebasing lives outside
+the tree in `../llama-cpp-upstream.git`; patches are re-applied per upstream
+snapshot and the exact commit is recorded in the version matrix above.
+
+## License
+
+AGPL-3.0 (same as VUGVA core). See [LICENSE](LICENSE).
+llama.cpp is MIT-licensed; see `llama.cpp/LICENSE`.
